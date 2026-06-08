@@ -113,11 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
+                "file": "对标ip内容逐字稿/JZ视频逐字稿.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "出链"
+              "title": "JZ视频逐字稿 的出链列表"
             }
           },
           {
@@ -183,7 +184,7 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "314b5f2385189fa5",
+  "active": "8e1aad1d88066fed",
   "lastOpenFiles": [
     "对标ip内容逐字稿/浩威 情感表达视频逐字稿.md",
     "对标ip内容逐字稿/JZ视频逐字稿.md",
