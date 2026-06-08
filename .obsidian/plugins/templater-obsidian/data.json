@@ -1,0 +1,58 @@
+{
+  "command_timeout": 5,
+  "templates_folder": "00_System/Templates",
+  "templates_pairs": [
+    [
+      "",
+      ""
+    ]
+  ],
+  "trigger_on_file_creation": false,
+  "auto_jump_to_cursor": true,
+  "enable_system_commands": false,
+  "shell_path": "",
+  "user_scripts_folder": "00_System/Scripts",
+  "enable_folder_templates": true,
+  "folder_templates": [
+    {
+      "folder": "10_IP/Ideas",
+      "template": "00_System/Templates/IP Idea.md"
+    },
+    {
+      "folder": "10_IP/Scripts",
+      "template": "00_System/Templates/Script.md"
+    },
+    {
+      "folder": "10_IP/Characters",
+      "template": "00_System/Templates/Character.md"
+    },
+    {
+      "folder": "20_Content/Publish",
+      "template": "00_System/Templates/Publish Record.md"
+    }
+  ],
+  "enable_file_templates": false,
+  "file_templates": [
+    {
+      "regex": ".*",
+      "template": ""
+    }
+  ],
+  "syntax_highlighting": true,
+  "syntax_highlighting_mobile": false,
+  "enabled_templates_hotkeys": [
+    "00_System/Templates/IP Idea.md",
+    "00_System/Templates/Script.md",
+    "00_System/Templates/Character.md",
+    "00_System/Templates/Publish Record.md"
+  ],
+  "startup_templates": [
+    ""
+  ],
+  "intellisense_render": 1,
+  "ignore_folders_on_creation": [
+    {
+      "folder": "00_System"
+    }
+  ]
+}
