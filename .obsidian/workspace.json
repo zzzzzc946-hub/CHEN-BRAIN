@@ -11,14 +11,10 @@
             "id": "314b5f2385189fa5",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "00｜MAX IP项目总控台/MAX IP项目总纲.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "MAX IP项目总纲"
+              "title": "新标签页"
             }
           }
         ]
@@ -94,7 +90,6 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "00｜MAX IP项目总控台/MAX IP项目总纲.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +99,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "MAX IP项目总纲 的反向链接列表"
+              "title": "反向链接"
             }
           },
           {
@@ -186,6 +181,7 @@
   },
   "active": "314b5f2385189fa5",
   "lastOpenFiles": [
+    "00｜MAX IP项目总控台/00｜项目总纲.md.md",
     "Inbox（md转换）/已转换/领域介绍.md",
     "Inbox（md转换）/原文件归档/codex-test.txt",
     "Inbox（md转换）/已转换/codex-test.md",
