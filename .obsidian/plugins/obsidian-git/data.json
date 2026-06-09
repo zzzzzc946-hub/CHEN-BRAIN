@@ -6,10 +6,10 @@
   "autoSaveInterval": 10,
   "autoPushInterval": 0,
   "autoPullInterval": 0,
-  "autoPullOnBoot": false,
+  "autoPullOnBoot": true,
   "autoCommitOnlyStaged": false,
   "disablePush": false,
-  "pullBeforePush": false,
+  "pullBeforePush": true,
   "disablePopups": false,
   "showErrorNotices": true,
   "disablePopupsForNoChanges": true,
@@ -63,5 +63,6 @@
     "ignoreWhitespace": false
   },
   "autoCommitInterval": 10,
-  "showRibbonIcon": true
+  "showRibbonIcon": true,
+  "gitPath": "/Users/chen.zip/.local/bin/git"
 }
