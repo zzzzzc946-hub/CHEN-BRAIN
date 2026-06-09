@@ -63,6 +63,5 @@
     "ignoreWhitespace": false
   },
   "autoCommitInterval": 10,
-  "showRibbonIcon": true,
-  "gitPath": "/Users/chen.zip/.local/bin/git"
+  "showRibbonIcon": true
 }
