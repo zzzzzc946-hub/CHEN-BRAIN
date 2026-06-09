@@ -11,10 +11,14 @@
             "id": "314b5f2385189fa5",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "关系图谱"
+              "type": "markdown",
+              "state": {
+                "file": "对标ip内容逐字稿/董太太 视频逐字稿.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "董太太 视频逐字稿"
             }
           }
         ]
@@ -90,6 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
+                "file": "对标ip内容逐字稿/董太太 视频逐字稿.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -99,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "反向链接"
+              "title": "董太太 视频逐字稿 的反向链接列表"
             }
           },
           {
@@ -181,6 +186,11 @@
   },
   "active": "314b5f2385189fa5",
   "lastOpenFiles": [
+    "Inbox（md转换）/已转换/领域介绍.md",
+    "Inbox（md转换）/原文件归档/codex-test.txt",
+    "Inbox（md转换）/已转换/codex-test.md",
+    "Inbox（md转换）/codex-test.txt",
+    "Inbox（md转换）/打造富人身份感的主场作战-文稿-转写结果.txt",
     "对标ip内容逐字稿/JZ视频逐字稿.md",
     "2026-06-09.md",
     "未命名.canvas",
