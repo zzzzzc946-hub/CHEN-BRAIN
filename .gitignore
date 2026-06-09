@@ -1,0 +1,43 @@
+# macOS system files
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+
+# Obsidian local workspace state
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# Obsidian cache / indexes / temporary files
+.obsidian/cache/
+.obsidian/caches/
+.obsidian/index/
+.obsidian/plugins/omnisearch/cache/
+.obsidian/plugins/omnisearch/.cache/
+.obsidian/plugins/*/cache/
+.obsidian/plugins/*/.cache/
+
+# Obsidian trash
+.trash/
+.obsidian/.trash/
+
+# Obsidian Local REST API secrets
+.obsidian/plugins/obsidian-local-rest-api/data.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
