@@ -138,7 +138,7 @@ def convert_pdf(src: Path) -> str:
 
 def convert_file(src: Path) -> tuple[bool, str]:
     suffix = src.suffix.lower()
-    if src.name.startswith(".") or src.name == Path(__file__).name:
+    if src.name.startswith(".") or src.name == Path(__file__).name or suffix == ".md":
         return False, ""
     if suffix not in SUPPORTED:
         return False, f"不支持格式：{src.name}"
