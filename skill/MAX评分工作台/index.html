@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAX 内容评分工作台</title>
+<style>
+  :root{
+    --paper:#EEEDE8; --card:#F7F6F2; --ink:#1C1D1B; --ink-soft:#5A5B56;
+    --line:#D8D6CE; --oxblood:#7A2A28; --brass:#8A6D2F; --green:#3E5C44;
+    --serif:'Songti SC','STSong','SimSun',serif;
+    --sans:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6}
+  .wrap{max-width:760px;margin:0 auto;padding:24px 16px 60px}
+  .head{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:10px;padding-bottom:14px;border-bottom:2px solid var(--ink)}
+  h1{font-family:var(--serif);font-size:24px;letter-spacing:2px}
+  .sub{font-size:12px;color:var(--ink-soft);margin-top:4px}
+  .nav{display:flex;gap:8px}
+  .btn{border:1px solid var(--ink);background:transparent;color:var(--ink);padding:7px 14px;font-size:13px;cursor:pointer;font-family:var(--sans)}
+  .btn:hover{background:rgba(0,0,0,.04)}
+  .btn.on{background:var(--ink);color:var(--paper)}
+  .btn.primary{background:var(--oxblood);color:var(--paper);border-color:var(--oxblood);font-weight:600}
+  .btn.primary:disabled{background:var(--line);border-color:var(--line);cursor:not-allowed}
+  .btn.ghost{border-color:var(--line);color:var(--ink-soft)}
+  .card{background:var(--card);border:1px solid var(--line);padding:18px;margin-top:18px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin:12px 0 4px}
+  input[type=text],textarea{width:100%;background:var(--paper);border:1px solid var(--line);padding:9px 12px;font-size:14px;color:var(--ink);font-family:var(--sans)}
+  textarea{line-height:1.8;resize:vertical}
+  input:focus,textarea:focus{outline:2px solid var(--oxblood);outline-offset:-1px}
+  .typebtns{display:flex;gap:8px}
+  .dim{padding:16px 0;border-bottom:1px solid var(--line)}
+  .dim-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .dim-name{font-family:var(--serif);font-weight:700;font-size:16px}
+  .dim-meta{font-size:11px;color:var(--ink-soft)}
+  .dim-val{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;min-width:54px;text-align:right}
+  input[type=range]{width:100%;margin-top:8px;accent-color:var(--oxblood)}
+  .anchors{display:flex;flex-direction:column;gap:4px;margin-top:10px}
+  .anchor{display:flex;gap:10px;align-items:flex-start;padding:6px 10px;border:1px solid transparent;background:transparent;cursor:pointer;text-align:left;font-size:12px;color:var(--ink-soft);width:100%;font-family:var(--sans);line-height:1.5}
+  .anchor:hover{border-color:var(--line)}
+  .anchor.hit{background:var(--paper);border-color:var(--oxblood);color:var(--ink)}
+  .anchor .as{font-weight:700;min-width:24px;font-variant-numeric:tabular-nums}
+  .anchor.hit .as{color:var(--oxblood)}
+  .quick-panel{padding:16px 0;border-bottom:1px solid var(--line)}
+  .quick-title{font-family:var(--serif);font-weight:700;font-size:17px}
+  .issue-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+  .issue{border:1px solid var(--line);background:transparent;color:var(--ink);padding:9px 10px;text-align:left;font-size:13px;cursor:pointer;font-family:var(--sans)}
+  .issue.on{background:var(--ink);border-color:var(--ink);color:var(--paper)}
+  .total-bar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-top:18px}
+  .total-num{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums}
+  .score-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
+  .score-box{border:1px solid var(--line);background:var(--paper);padding:12px}
+  .score-box .k{font-size:12px;color:var(--ink-soft);font-weight:600}
+  .score-box .v{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1;margin-top:4px}
+  .score-box .m{font-size:11px;color:var(--ink-soft);margin-top:4px}
+  .seal{display:inline-block;border:3px solid;padding:8px 18px;font-family:var(--serif);font-size:24px;font-weight:700;letter-spacing:6px;transform:rotate(-5deg);user-select:none}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:14px}
+  th{text-align:left;font-size:11px;color:var(--ink-soft);font-weight:600;padding:4px 8px 4px 0}
+  td{padding:8px 8px 8px 0;border-top:1px solid var(--line);vertical-align:top}
+  .warn{color:var(--oxblood);font-weight:700}
+  .item{display:flex;justify-content:space-between;align-items:center;gap:12px;width:100%;background:var(--card);border:1px solid var(--line);padding:12px 14px;margin-top:8px;cursor:pointer;text-align:left;font-family:var(--sans)}
+  .item:hover{border-color:var(--ink)}
+  .item-t{font-family:var(--serif);font-weight:600;font-size:15px;color:var(--ink)}
+  .item-m{font-size:11px;color:var(--ink-soft);margin-top:2px}
+  .item-s{text-align:right;flex-shrink:0}
+  .item-num{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+  .item-v{font-size:11px;font-weight:700}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border:1px solid}
+  .notice{margin-top:12px;padding:10px 12px;font-size:13px;border:1px solid var(--line);background:var(--paper)}
+  .notice.err{border-color:var(--oxblood)}
+  .notice.ok{border-color:var(--green)}
+  details{margin-top:10px}
+  summary{font-size:13px;font-weight:600;cursor:pointer}
+  pre{white-space:pre-wrap;background:var(--paper);border:1px solid var(--line);padding:12px;font-size:12px;line-height:1.8;margin-top:8px;font-family:var(--sans)}
+  .muted{color:var(--ink-soft);font-size:12px}
+  .center{text-align:center;padding:40px 0}
+  a{color:var(--oxblood)}
+  @media (max-width:520px){h1{font-size:20px}.dim-val{font-size:22px}.seal{font-size:18px;letter-spacing:4px}.score-grid,.issue-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+
+<script>
+/* MAX 内容评分工作台 · 本地服务器版
+   数据层：max_score.py serve 提供的本地API（与codex CLI共用同一份 scores_db.json）
+   盲评保护由服务端强制：人工分未录入的记录，API不返回AI明细 */
+
+const DIMS = [
+  {key:'first', label:'第一印象', weight:.15, hint:'不分析，凭直觉：读完有没有被抓住',
+   anchors:[[10,'有生理反应——中途停下回读某句、想立刻转给人，直觉这条会爆'],[8,'整体被抓住，有一两处明显的「诶？」，愿意马上读第二遍'],[6,'顺畅读完，不反感，但放下就忘。属于「还行」'],[3,'读到一半开始扫读、跳行'],[1,'第一段就想关掉']]},
+  {key:'real', label:'真实感', weight:.15, hint:'像人说话还是像AI写作',
+   anchors:[[10,'完全像MAX本人在镜头前说话：有口语毛边、有停顿、敢断敢停，挑不出一句「写出来的」'],[8,'整体像人，但有一两处工整对仗或总结式收尾暴露写作痕迹'],[6,'半人半文——判断像人，结构像作文：排比连发、「你以为/其实」、漂亮收尾'],[3,'通篇书面语，概念词堆叠，金句一句接一句'],[1,'一眼AI，模板结构']]},
+  {key:'depth', label:'文章深度', weight:.20, hint:'增量检验：用户带走了哪个他原来不知道的判断？答不出→≤3；常见选题+常见角度→≤3',
+   anchors:[[10,'至少一个判断让人愣住——「我从没这么想过，但他是对的」，公共素材里抄不到'],[8,'有明确增量，机制讲透或视角确实新，但最深那层行业内能找到相似表述'],[6,'逻辑成立、机制有讲，但核心判断是用户已知道理的精致复述——「说了像没说」'],[3,'只有结论没有机制；或增量检验不通过'],[1,'常识，口水']]},
+  {key:'scene', label:'场景度', weight:.15, hint:'是否从35+目标用户的真实场景和动作出发',
+   anchors:[[10,'场景细到监控感——时间、顺序、配文原句、照片构图，且是35+有事业男性的高配版行为'],[8,'场景和动作真实具体，但停在「很多人都这样」的通用级'],[6,'有场景但是概括的（「发了很多照片」而不是「那张方向盘入镜的」）'],[3,'从概念倒推场景，或画像错位（写成25岁小伙的行为）'],[1,'全程抽象概念，没有场景']]},
+  {key:'fit', label:'MAX贴合度', weight:.15, hint:'考核判断方式的继承，不是语气模仿；堆口头禅反而扣分',
+   anchors:[[10,'观察方式、判断方式、立场全在MAX体系内，是MAX会做但还没做的判断。换别的账号发不成立'],[8,'判断方向和价值观对，个别用词或边界出了体系，小修即可'],[6,'内容不错但通用——换任何情感号都成立；或靠堆口头禅制造表面相似'],[3,'违背校准库沉淀：用了硬禁用表达、空用慎用词、立场松动'],[1,'价值观跑偏——油腻、说教、讨好（触红线整篇0分）']]},
+  {key:'value', label:'用户价值', weight:.20, hint:'用户带走了什么——痛了、悟了、学到了',
+   anchors:[[10,'必然带走东西——被刺穿（痛：这说的就是我）或拿到可复用判断（学），并想关注这个人'],[8,'有明确的一次刺痛或一次学到，但只有一次'],[6,'道理都对、说得也顺，但用户看完认知不变、行为不变'],[3,'说教感——用户感觉在被教育，不是被看见'],[1,'浪费用户三分钟']]},
+];
+const TYPES = ['流量型','人设型','转化型'];
+const ISSUE_OPTIONS = ['不抓人','不真实','没增量','场景弱','不像MAX','用户价值弱'];
+const VERDICTS = [
+  {min:9.0, label:'好内容', color:'var(--brass)',  action:'优先拍摄，纳入投放候选，表现好即追投'},
+  {min:8.0, label:'可以拍', color:'var(--green)',  action:'正常排期拍摄发布'},
+  {min:6.5, label:'需要修改', color:'var(--oxblood)', action:'针对最低分维度修改，提交修改稿重评；二评仍不到8则PASS'},
+  {min:-1,  label:'PASS',  color:'var(--ink)',    action:'不通过。连选题和角度一起重新判断'},
+];
+const verdictOf = t => VERDICTS.find(v=>t>=v.min);
+const calcTotal = s => Math.round(DIMS.reduce((t,d)=>t+(s[d.key]||0)*d.weight,0)*100)/100;
+const HUMAN_PRE_WEIGHT = 0.70;
+const AI_PRE_WEIGHT = 0.30;
+const calcPreTotal = v => {
+  if(v.humanTotal==null) return null;
+  if(v.aiTotal==null) return v.humanTotal;
+  return Math.round((v.humanTotal*HUMAN_PRE_WEIGHT + v.aiTotal*AI_PRE_WEIGHT)*100)/100;
+};
+const bandOf = v => v>=9?10 : v>=7?8 : v>=4.5?6 : v>=2?3 : 1;
+
+const S = { entries:[], loaded:false, err:'', view:'todo', detailId:null,
+  scoring:null,   // {id, scores}  正在打分
+  draft:null,     // {title,type,script} 新建表单
+  rev:null,       // {id, note, script} 修改稿表单
+  msg:'' };
+const emptyScores = ()=>Object.fromEntries(DIMS.map(d=>[d.key,6]));
+const $ = id=>document.getElementById(id);
+const esc = s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const fmtDate = iso=>new Date(iso).toLocaleDateString('zh-CN');
+
+async function api(path, body){
+  const res = await fetch(path, body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:undefined);
+  const data = await res.json().catch(()=>({error:'响应解析失败'}));
+  if(!res.ok || data.error) throw new Error(data.error||('HTTP '+res.status));
+  return data;
+}
+async function refresh(){
+  try{ S.entries = await api('/api/entries'); S.err=''; }
+  catch(e){ S.err='无法连接本地服务：请确认已运行 python max_score.py serve（'+e.message+'）'; }
+  S.loaded = true; render();
+}
+
+// 状态判定：最新版本
+function statusOf(en){
+  const v = en.versions[0];
+  if(v.human===null && !v.aiDone) return {key:'score_now', text:'待人工评分 · 提交后揭晓AI', color:'var(--oxblood)'};
+  if(v.human===null && v.aiDone)  return {key:'score_now', text:'待人工评分 · AI已封存', color:'var(--oxblood)'};
+  if(v.human!==null && !v.aiDone) return {key:'wait_ai_reveal', text:'人工已评 · 待AI揭晓', color:'var(--brass)'};
+  const preTotal = calcPreTotal(v);
+  return {key:'done', text:verdictOf(preTotal).label, color:verdictOf(preTotal).color};
+}
+
+// ---------- 渲染 ----------
+function render(){
+  const todo = S.entries.filter(e=>statusOf(e).key!=='done');
+  let html = `
+  <div class="head">
+    <div><h1>MAX 内容评分工作台</h1>
+      <div class="sub">评分体系 V2.1 · 拍摄线 8.0 · 数据与codex共用 scores_db.json</div></div>
+    <div class="nav">
+      <button class="btn ${S.view==='todo'?'on':''}" onclick="go('todo')">待办（${todo.length}）</button>
+      <button class="btn ${S.view==='list'?'on':''}" onclick="go('list')">记录库（${S.entries.length}）</button>
+      <button class="btn" onclick="refresh()">刷新</button>
+    </div>
+  </div>`;
+  if(!S.loaded){ html+='<p class="center muted">连接本地服务中…</p>'; $('app').innerHTML=html; return; }
+  if(S.err){ html+=`<div class="notice err">${esc(S.err)}</div>`; $('app').innerHTML=html; return; }
+  if(S.msg){ html+=`<div class="notice ok">${esc(S.msg)}</div>`; }
+
+  if(S.view==='todo') html += renderTodo();
+  if(S.view==='list') html += renderListView();
+  if(S.view==='detail') html += renderDetail();
+  $('app').innerHTML = html;
+}
+
+function renderDim(d, val){
+  const band = bandOf(val);
+  return `<div class="dim">
+    <div class="dim-head">
+      <div><span class="dim-name">${d.label}</span>
+        <span class="dim-meta"> 权重 ${Math.round(d.weight*100)}% · ${d.hint}</span></div>
+      <span class="dim-val" id="val-${d.key}" style="color:${val>=8?'var(--green)':val>=6?'var(--brass)':'var(--oxblood)'}">${val.toFixed(1)}</span>
+    </div>
+    <input type="range" min="0" max="10" step="0.5" value="${val}" oninput="setScore('${d.key}',this.value)">
+    <div class="anchors" id="anc-${d.key}">
+      ${d.anchors.map(([sc,txt])=>`<button class="anchor ${band===sc?'hit':''}" onclick="quickSet('${d.key}',${sc})"><span class="as">${sc}</span><span>${txt}</span></button>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderTodo(){
+  let h='';
+  // 新建入口
+  if(!S.draft && !S.scoring){
+    h += `<div style="margin-top:14px"><button class="btn primary" onclick="S.draft={title:'',type:'流量型',script:''};render()">＋ 新建评分记录</button>
+      <span class="muted" style="margin-left:10px">创建后会立刻进入人工评分；提交后马上揭晓AI分、分差和总结戳</span></div>`;
+  }
+  if(S.draft){
+    h += `<div class="card">
+      <label>选题标题</label><input type="text" id="f-title" value="${esc(S.draft.title)}" placeholder="例：为什么你越想展示自己，越容易显得廉价">
+      <label>内容类型</label><div class="typebtns">${TYPES.map(t=>`<button class="btn ${S.draft.type===t?'on':''}" onclick="syncDraft();S.draft.type='${t}';render()">${t}</button>`).join('')}</div>
+      <label>口播文案（粘贴全文）</label><textarea id="f-script" rows="12">${esc(S.draft.script)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn primary" onclick="createEntry()">创建并开始人工评分</button>
+        <button class="btn" onclick="S.draft=null;render()">取消</button></div>
+    </div>`;
+  }
+  // 正在打分
+  if(S.scoring){
+    const en = S.entries.find(e=>e.id===S.scoring.id);
+    h += `<div class="card">
+      <p style="font-family:var(--serif);font-weight:700">${esc(en.title)} <span class="muted">· ${en.type} · 第${en.versions[0].v}稿</span></p>
+      <p class="muted" style="margin:4px 0 8px">你只需要给整体感受。AI会在后台做六维诊断，提交后生成发布前总评分和执行判断。</p>
+      <div class="quick-panel">
+        <div class="dim-head">
+          <div><span class="quick-title">人工总分</span>
+            <span class="dim-meta"> 10分制，凭你看完这篇的整体判断</span></div>
+          <span class="dim-val" id="val-overall" style="color:${S.scoring.total>=8?'var(--green)':S.scoring.total>=6?'var(--brass)':'var(--oxblood)'}">${S.scoring.total.toFixed(1)}</span>
+        </div>
+        <input type="range" min="0" max="10" step="0.5" value="${S.scoring.total}" oninput="setOverall(this.value)">
+      </div>
+      <div class="quick-panel">
+        <div class="quick-title">主要问题</div>
+        <p class="muted">最多选2个。它会帮助AI理解你的语感，不选也可以。</p>
+        <div class="issue-grid">${ISSUE_OPTIONS.map(x=>`<button class="issue ${S.scoring.issues.includes(x)?'on':''}" onclick="toggleIssue('${x}')">${x}</button>`).join('')}</div>
+      </div>
+      <label>一句话评价</label>
+      <textarea id="human-note" rows="3" placeholder="例：判断方向对，但不像MAX；有道理，可是不够刺。">${esc(S.scoring.note||'')}</textarea>
+      <div class="total-bar">
+        <div>人工总分 <span class="total-num" id="total" style="color:${S.scoring.total>=8?'var(--green)':'var(--oxblood)'}">${S.scoring.total.toFixed(1)}</span>
+          <div class="muted">提交后结合AI评分，生成10分制发布前总评分。</div></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="S.scoring=null;render()">取消</button>
+          <button class="btn primary" onclick="submitHuman()">提交评分并揭晓结果</button></div>
+      </div></div>`;
+    return h;
+  }
+  // 待办列表
+  const todo = S.entries.filter(e=>statusOf(e).key!=='done');
+  if(!todo.length && !S.draft) h += `<p class="center muted">没有待办。新建一条，或在记录库查看已完成的评分。</p>`;
+  todo.forEach(en=>{
+    const st = statusOf(en), v = en.versions[0];
+    h += `<div class="item" onclick="${st.key==='score_now'?`startScoring('${en.id}')`:`openDetail('${en.id}')`}" style="cursor:pointer">
+      <div style="min-width:0"><div class="item-t">${esc(en.title)}</div>
+        <div class="item-m">${en.type} · ${fmtDate(en.createdAt)} · 第${v.v}稿${v.changeNote?' · 改：'+esc(v.changeNote.slice(0,20)):''}</div></div>
+      <div class="item-s"><span class="badge" style="color:${st.color};border-color:${st.color}">${st.text}</span></div>
+    </div>`;
+  });
+  return h;
+}
+
+function renderDiff(v){
+  const hasHumanDims = v.human && DIMS.every(d=>v.human[d.key]!==undefined);
+  if(!hasHumanDims){
+    const totalDiff = Math.abs(v.humanTotal - (v.aiTotal ?? v.humanTotal));
+    const rows = DIMS.map(d=>`<tr><td><b>${d.label}</b></td><td>${v.ai[d.key].toFixed(1)}</td>
+      <td class="muted" style="font-size:12px">${esc((v.aiMeta&&v.aiMeta.reasons||{})[d.key]||'')}</td></tr>`).join('');
+    return `<table><thead><tr><th>AI诊断维度</th><th>AI分</th><th>AI理由</th></tr></thead><tbody>${rows}</tbody></table>
+    ${totalDiff>=1.5?`<p class="warn" style="font-size:12px;margin-top:8px">⚠ 人工总分与AI总分差值 ${totalDiff.toFixed(1)}，建议记录校准：AI高估/低估了什么。</p>`:''}`;
+  }
+  const rows = DIMS.map(d=>{
+    const diff = Math.abs((v.human[d.key]||0)-(v.ai[d.key]??0));
+    const warn = diff>=2;
+    return `<tr><td><b>${d.label}</b></td><td>${(v.human[d.key]||0).toFixed(1)}</td><td>${v.ai[d.key].toFixed(1)}</td>
+      <td class="${warn?'warn':''}">${warn?'⚠ ':''}${diff.toFixed(1)}</td>
+      <td class="muted" style="font-size:12px">${esc((v.aiMeta&&v.aiMeta.reasons||{})[d.key]||'')}</td></tr>`;
+  }).join('');
+  const hasWarn = DIMS.some(d=>Math.abs(v.human[d.key]-v.ai[d.key])>=2);
+  return `<table><thead><tr><th>维度</th><th>人工分</th><th>AI分</th><th>差值</th><th>AI理由</th></tr></thead><tbody>${rows}</tbody></table>
+  ${hasWarn?`<p class="warn" style="font-size:12px;margin-top:8px">⚠ 存在维度差值≥2，需记入语感校准库（写明AI高估/低估了什么）。</p>`:''}`;
+}
+
+function renderResultCard(en){
+  const v = en.versions[0], preTotal = calcPreTotal(v), vd = verdictOf(preTotal);
+  const humanMeta = v.humanMeta || {};
+  return `<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px;align-items:flex-start">
+    <div><p style="font-family:var(--serif);font-weight:700;font-size:17px">${esc(en.title)}</p>
+      <p class="muted">${en.type} · 第${v.v}稿${v.feishu_record_id?' · 已同步飞书✓':''}</p>
+      <div class="score-grid">
+        <div class="score-box"><div class="k">发布前总评分</div><div class="v" style="color:${preTotal>=8?'var(--green)':'var(--oxblood)'}">${preTotal.toFixed(2)}</div><div class="m">最终执行判断以此为准</div></div>
+        <div class="score-box"><div class="k">评分来源</div><div style="font-size:15px;margin-top:8px">人工 ${v.humanTotal.toFixed(2)} <span style="color:var(--line)">|</span> AI ${v.aiTotal!=null?v.aiTotal.toFixed(2):'—'}</div><div class="m">人工为主，AI辅助校准</div></div>
+      </div>
+      <p class="muted" style="margin-top:10px">执行判断：${vd.action}</p></div>
+    <span class="seal" style="border-color:${vd.color};color:${vd.color}">${vd.label}</span>
+  </div>
+  ${(humanMeta.issues&&humanMeta.issues.length)||humanMeta.note?`<div class="notice" style="margin-top:12px">
+    ${humanMeta.issues&&humanMeta.issues.length?`<p><b>人工主因：</b>${esc(humanMeta.issues.join('、'))}</p>`:''}
+    ${humanMeta.note?`<p><b>一句话评价：</b>${esc(humanMeta.note)}</p>`:''}
+  </div>`:''}
+  ${v.ai?renderDiff(v):'<p class="muted" style="margin-top:10px">AI盲评未录入（可让codex补跑 ai 命令）</p>'}
+  ${v.aiMeta&&v.aiMeta.weakest?`<p style="margin-top:12px;font-size:13px"><b>AI自认最弱：</b><span class="muted">${esc(v.aiMeta.weakest)}</span></p>`:''}
+  ${v.aiMeta&&v.aiMeta.uncertain&&v.aiMeta.uncertain.length?`<p style="font-size:13px"><b>AI拿不准：</b><span class="muted">${esc(v.aiMeta.uncertain.join('；'))}</span></p>`:''}
+  ${preTotal<8&&v.v>=2?`<p class="warn" style="font-size:13px;margin-top:8px">二评总评分仍不到8分，按体系规则：PASS。</p>`:''}`;
+}
+
+function renderListView(){
+  let h='';
+  if(!S.entries.length) return '<p class="center muted">还没有评分记录。</p>';
+  S.entries.forEach(en=>{
+    const st = statusOf(en), v = en.versions[0];
+    const preTotal = calcPreTotal(v);
+    const num = preTotal!=null?preTotal.toFixed(1):'—';
+    h += `<button class="item" onclick="openDetail('${en.id}')">
+      <div style="min-width:0"><div class="item-t">${esc(en.title)}</div>
+        <div class="item-m">${en.type} · ${fmtDate(en.createdAt)} · 第${v.v}稿</div></div>
+      <div class="item-s"><div class="item-num">${num}</div>
+        <div class="item-v" style="color:${st.color}">${st.text}</div></div>
+    </button>`;
+  });
+  return h;
+}
+
+function renderDetail(){
+  const en = S.entries.find(e=>e.id===S.detailId); if(!en) return '';
+  const v = en.versions[0], st = statusOf(en);
+  let h = `<p style="margin-top:14px"><a href="javascript:void(0)" onclick="go('list')" style="font-size:13px">← 返回记录库</a></p><div class="card">`;
+  if(st.key==='done') h += renderResultCard(en);
+  else if(st.key==='wait_ai_reveal') h += `<p style="font-family:var(--serif);font-weight:700;font-size:17px">${esc(en.title)}</p>
+    <p class="muted">${en.type} · 第${v.v}稿 · <span style="color:${st.color}">${st.text}</span></p>
+    <p style="margin-top:12px;font-size:14px">人工评分 <b style="font-size:24px">${v.humanTotal.toFixed(2)}</b></p>
+    <div class="notice" style="margin-top:12px">你的人工分已经保存。AI盲评完成后，本页会自动刷新并揭晓AI分、差值和理由。</div>`;
+  else h += `<p style="font-family:var(--serif);font-weight:700;font-size:17px">${esc(en.title)}</p>
+    <p class="muted">${en.type} · 第${v.v}稿 · <span style="color:${st.color}">${st.text}</span></p>
+    <button class="btn primary" style="margin-top:10px" onclick="startScoring('${en.id}');go('todo')">去打分</button>
+    <p class="muted" style="margin-top:8px">AI盲评会在后台封存；人工分提交前，页面不会展示AI明细。</p>`;
+  h += `<details><summary>查看当前稿文案</summary><pre>${esc(v.script)}</pre></details>`;
+  if(en.versions.length>1){
+    h += `<details><summary>历史版本（${en.versions.length-1}）</summary>`;
+    en.versions.slice(1).forEach(ov=>{
+      const next = en.versions.find(x=>x.v===ov.v+1);
+      const ovh = ov.humanTotal!=null?ov.humanTotal.toFixed(2):'—';
+      h += `<pre><b>第${ov.v}稿</b> · 人工 ${ovh} · ${ov.humanTotal!=null?verdictOf(ov.humanTotal).label:'未评'}${next&&next.changeNote?'\n下一稿修改说明：'+esc(next.changeNote):''}</pre>`;
+    });
+    h += `</details>`;
+  }
+  if(st.key==='done'){
+    if(!S.rev) h += `<div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn primary" onclick="S.rev={id:'${en.id}',note:'',script:${JSON.stringify(esc(v.script)).replace(/"/g,'&quot;')}};startRev('${en.id}')">提交修改稿</button>
+      <button class="btn" onclick="doSync('${en.id}')">${v.feishu_record_id?'重新同步飞书':'同步到飞书'}</button></div>`;
+    else h += `<div class="card" style="border-color:var(--oxblood);background:var(--paper)">
+      <p style="font-family:var(--serif);font-weight:700">第${v.v+1}稿</p>
+      <label>改了什么（必填——这是AI理解校准方向的关键）</label>
+      <input type="text" id="r-note" value="${esc(S.rev.note)}" placeholder="例：换掉开头低龄画像，删结尾两句金句">
+      <label>修改后全文</label><textarea id="r-script" rows="12">${esc(S.rev.script)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn primary" onclick="submitRev()">创建修改稿（之后让codex先盲评）</button>
+        <button class="btn" onclick="S.rev=null;render()">取消</button></div></div>`;
+  }
+  h += `</div>`;
+  return h;
+}
+
+// ---------- 动作 ----------
+function go(v){ S.view=v; S.msg=''; S.rev=null; render(); }
+function openDetail(id){ S.detailId=id; S.view='detail'; S.msg=''; S.rev=null; render(); }
+function startRev(id){ const en=S.entries.find(e=>e.id===id); S.rev={id, note:'', script:en.versions[0].script}; render(); }
+function syncDraft(){ if($('f-title'))S.draft.title=$('f-title').value; if($('f-script'))S.draft.script=$('f-script').value; }
+function startScoring(id){ S.scoring={id, total:7, issues:[], note:''}; S.view='todo'; S.msg=''; render(); }
+
+function syncScoring(){
+  if(!S.scoring) return;
+  const note = $('human-note');
+  if(note) S.scoring.note = note.value;
+}
+
+function setOverall(val){
+  val=parseFloat(val); S.scoring.total=val;
+  const el=$('val-overall');
+  if(el){ el.textContent=val.toFixed(1); el.style.color=val>=8?'var(--green)':val>=6?'var(--brass)':'var(--oxblood)'; }
+  const tot=$('total');
+  if(tot){ tot.textContent=val.toFixed(1); tot.style.color=val>=8?'var(--green)':'var(--oxblood)'; }
+}
+
+function toggleIssue(issue){
+  syncScoring();
+  const i = S.scoring.issues.indexOf(issue);
+  if(i>=0) S.scoring.issues.splice(i,1);
+  else {
+    if(S.scoring.issues.length>=2) S.scoring.issues.shift();
+    S.scoring.issues.push(issue);
+  }
+  render();
+}
+
+function setScore(key,val){
+  val=parseFloat(val); S.scoring.scores[key]=val;
+  const el=$('val-'+key);
+  if(el){ el.textContent=val.toFixed(1); el.style.color=val>=8?'var(--green)':val>=6?'var(--brass)':'var(--oxblood)'; }
+  const tot=$('total');
+  if(tot){ const t=calcTotal(S.scoring.scores); tot.textContent=t.toFixed(2); tot.style.color=t>=8?'var(--green)':'var(--oxblood)'; }
+  const band=bandOf(val), anc=$('anc-'+key);
+  if(anc){ [...anc.children].forEach(b=>{ const sc=parseInt(b.querySelector('.as').textContent); b.classList.toggle('hit',sc===band); }); }
+}
+function quickSet(key,sc){
+  setScore(key,sc);
+  const slider=$('anc-'+key).parentElement.querySelector('input[type=range]');
+  if(slider) slider.value=sc;
+}
+
+async function createEntry(){
+  syncDraft();
+  try{
+    const r = await api('/api/new',{title:S.draft.title,type:S.draft.type,script:S.draft.script});
+    const newId = r.id;
+    S.draft=null; S.msg='已创建。现在先完成你的人工评分；提交后会立刻揭晓AI对比。';
+    await refresh();
+    S.scoring={id:newId, total:7, issues:[], note:''};
+    S.view='todo';
+    render();
+  }catch(e){ alert(e.message); }
+}
+async function submitHuman(){
+  syncScoring();
+  try{
+    const r = await api('/api/human',{id:S.scoring.id,total:S.scoring.total,issues:S.scoring.issues,note:S.scoring.note});
+    const id=S.scoring.id; S.scoring=null;
+    S.msg = r.sync ? r.sync.message : '人工分已保存，AI对比已揭晓';
+    await refresh();
+    S.detailId=id; S.view='detail'; render();
+  }catch(e){ alert(e.message); }
+}
+async function submitRev(){
+  S.rev.note=$('r-note').value; S.rev.script=$('r-script').value;
+  try{
+    const r = await api('/api/revise',{id:S.rev.id,note:S.rev.note,script:S.rev.script});
+    S.rev=null; S.msg=r.msg;
+    await refresh(); S.view='todo'; render();
+  }catch(e){ alert(e.message); }
+}
+async function doSync(id){
+  try{
+    const r = await api('/api/sync',{id});
+    S.msg=r.msg+'（record_id: '+r.record_id+'）';
+    await refresh(); S.detailId=id; S.view='detail'; render();
+  }catch(e){ alert('同步失败：'+e.message); }
+}
+
+refresh();
+setInterval(()=>{ if(!S.scoring && !S.draft && !S.rev) refresh(); }, 8000); // 自动刷新：codex评完盲评后页面自动更新
+</script>
+</body>
+</html>

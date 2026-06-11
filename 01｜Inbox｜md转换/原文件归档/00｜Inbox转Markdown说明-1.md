@@ -1,16 +1,6 @@
 ---
 title: 00｜Inbox转Markdown说明
 source_file: 00｜Inbox转Markdown说明.md
-converted: 2026-06-12
-tags:
-  - inbox/md转换
----
-
-# 00｜Inbox转Markdown说明
-
----
-title: 00｜Inbox转Markdown说明
-source_file: 00｜Inbox转Markdown说明.md
 converted: 2026-06-11
 tags:
   - inbox/md转换
