@@ -1,0 +1,18 @@
+#!/bin/zsh
+cd "$(dirname "$0")"
+echo "正在打开飞书应用消息权限页面..."
+echo "需要开通以下任一/相关权限："
+echo "- im:message:send"
+echo "- im:message"
+echo "- im:message:send_as_bot"
+echo ""
+echo "权限用途：允许 Codex 通过飞书应用/机器人发送消息给你。"
+open "https://open.feishu.cn/app/cli_aaa3c5a0c1389bcf/auth?q=im:message:send,im:message,im:message:send_as_bot&op_from=openapi&token_type=tenant"
+echo ""
+echo "打开后请申请/开通消息发送相关权限。"
+echo "如果页面要求发布新版本，请创建版本并发布/启用应用。"
+echo "如果还没启用机器人能力，也请在应用功能里启用机器人。"
+echo "完成后回来双击：发送测试消息.command"
+echo ""
+echo "按回车关闭窗口。"
+read
