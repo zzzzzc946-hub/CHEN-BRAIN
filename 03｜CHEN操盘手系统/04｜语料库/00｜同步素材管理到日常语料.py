@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 
 
-VAULT_ROOT = Path(__file__).resolve().parents[1]
+VAULT_ROOT = Path(os.environ.get("CHEN_BRAIN_ROOT", Path(__file__).resolve().parents[1]))
 CORPUS_DIR = VAULT_ROOT / "语料库"
 MATERIALS_DIR = CORPUS_DIR / "素材管理"
 TARGET = CORPUS_DIR / "日常语料逐字稿合集.md"

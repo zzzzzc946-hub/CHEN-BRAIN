@@ -1,5 +1,0 @@
-views:
-  - type: table
-    name: 表格
-  - type: list
-    name: 视图

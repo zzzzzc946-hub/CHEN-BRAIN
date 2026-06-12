@@ -31,6 +31,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # Temporary files
+*.pid
 *.tmp
 *.temp
 *.swp
@@ -41,3 +42,6 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+
+# MAX local scoring system secrets
+04｜MAX × CHEN AI协同系统/MAX文案评分系统/config.json

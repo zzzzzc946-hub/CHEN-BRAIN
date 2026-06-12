@@ -7,9 +7,16 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/chen.zip/Desktop/CHEN BRAIN/语料库/00｜同步素材管理到日常语料.py</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>CHEN_BRAIN_ROOT='/Users/chen.zip/Desktop/CHEN BRAIN' /usr/bin/python3 '/Users/chen.zip/Library/Application Support/CHEN-BRAIN/sync_materials_to_daily.py'; sleep 10</string>
   </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CHEN_BRAIN_ROOT</key>
+    <string>/Users/chen.zip/Desktop/CHEN BRAIN</string>
+  </dict>
 
   <key>WorkingDirectory</key>
   <string>/Users/chen.zip/Desktop/CHEN BRAIN</string>
