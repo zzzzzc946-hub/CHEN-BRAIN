@@ -1,4 +1,5 @@
 config.json
 .env
 .feishu_token_cache.json
+cookies.txt
 __pycache__/

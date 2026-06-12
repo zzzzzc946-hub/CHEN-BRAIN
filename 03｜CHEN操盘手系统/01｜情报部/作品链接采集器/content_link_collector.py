@@ -17,7 +17,10 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -118,6 +121,19 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg.setdefault("fields", {})
     cfg["fields"] = {**DEFAULT_FIELDS, **cfg.get("fields", {})}
     cfg.setdefault("platforms", {})
+    cfg.setdefault("asr", {})
+    cfg["asr"].setdefault("backend", "local")
+    cfg["asr"].setdefault("local_model", "base")
+    cfg["asr"].setdefault("language", "zh")
+    cfg["asr"].setdefault("initial_prompt", "以下是中文短视频口播逐字稿，请保留自然的中文标点、英文专有名词和段落。")
+    cfg["asr"].setdefault("format_transcript", True)
+    cfg.setdefault("yt_dlp", {})
+    cfg["yt_dlp"].setdefault("enabled", True)
+    cfg["yt_dlp"].setdefault("cookies_file", str(HERE / "cookies.txt"))
+    cfg["yt_dlp"].setdefault("cookies_from_browser", "")
+    cfg.setdefault("openai", {})
+    cfg["openai"].setdefault("transcribe_model", "gpt-4o-transcribe")
+    cfg["openai"].setdefault("language", "zh")
     return cfg
 
 
@@ -342,6 +358,37 @@ def fetch_json_url(url: str, cfg: Dict[str, Any], platform: str) -> Optional[Dic
         return None
 
 
+def pick_video_url(video: Dict[str, Any]) -> str:
+    for key in ("play_addr", "download_addr", "playAddr", "downloadAddr"):
+        value = video.get(key)
+        if isinstance(value, dict):
+            for list_key in ("url_list", "urlList", "urls"):
+                for item in value.get(list_key) or []:
+                    if isinstance(item, str) and item.startswith(("http://", "https://")):
+                        return item
+            direct = value.get("url")
+            if isinstance(direct, str) and direct.startswith(("http://", "https://")):
+                return direct
+        got = first_url(value)
+        if got.startswith(("http://", "https://")):
+            return got
+    for item in video.get("bit_rate") or []:
+        if isinstance(item, dict):
+            got = pick_video_url(item.get("play_addr") or {})
+            if got:
+                return got
+    return ""
+
+
+def is_media_url(value: str) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def media_url_or_empty(meta: Dict[str, Any]) -> str:
+    got = meta.get("media_url") or ""
+    return got if is_media_url(got) else ""
+
+
 def extract_douyin_api(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     aweme_id = douyin_aweme_id(url)
     if not aweme_id:
@@ -368,6 +415,7 @@ def extract_douyin_api(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "comments": to_int(stat.get("comment_count")),
         "shares": to_int(stat.get("share_count")),
         "published_at": to_time_text(detail.get("create_time")),
+        "media_url": pick_video_url(video),
     }
 
 
@@ -377,6 +425,261 @@ def merge_meta(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, A
         if out.get(key) in ("", None, [], {}):
             out[key] = value
     return out
+
+
+def ytdlp_path() -> Optional[str]:
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    user_bin = Path.home() / "Library" / "Python" / "3.9" / "bin" / "yt-dlp"
+    if user_bin.exists():
+        return str(user_bin)
+    return None
+
+
+def extract_with_ytdlp(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    ytdlp_cfg = cfg.get("yt_dlp") or {}
+    if not ytdlp_cfg.get("enabled", True):
+        return {}
+    exe = ytdlp_path()
+    if not exe:
+        return {}
+    cmd = [exe, "--dump-json", "--no-warnings", "--no-playlist", url]
+    cookies_file = ytdlp_cfg.get("cookies_file") or ""
+    if cookies_file and Path(cookies_file).expanduser().exists():
+        cmd.extend(["--cookies", str(Path(cookies_file).expanduser())])
+    cookies_from_browser = (ytdlp_cfg.get("cookies_from_browser") or "").strip()
+    if cookies_from_browser:
+        cmd.extend(["--cookies-from-browser", cookies_from_browser])
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    if result.returncode != 0 or not result.stdout.strip():
+        err = (result.stderr or "").strip()
+        if "Fresh cookies" in err or "cookies" in err.lower():
+            raise RuntimeError("yt-dlp 需要登录 Cookie；请配置 cookies.txt 或 cookies_from_browser。")
+        return {}
+    payload = json.loads(result.stdout.splitlines()[-1])
+    formats = payload.get("formats") or []
+    media_url = payload.get("url") or ""
+    if not is_media_url(media_url):
+        for fmt in reversed(formats):
+            got = fmt.get("url")
+            if is_media_url(got):
+                media_url = got
+                break
+    return {
+        "source_url": url,
+        "final_url": payload.get("webpage_url") or url,
+        "platform": detect_platform(url),
+        "title": clean_title(payload.get("title") or payload.get("description") or ""),
+        "caption": "",
+        "cover_url": payload.get("thumbnail") or "",
+        "duration": to_duration(payload.get("duration")),
+        "likes": to_int(payload.get("like_count")),
+        "comments": to_int(payload.get("comment_count")),
+        "shares": to_int(payload.get("repost_count")),
+        "published_at": to_time_text(payload.get("timestamp") or payload.get("upload_date")),
+        "media_url": media_url,
+    }
+
+
+def load_openai_key(cfg: Dict[str, Any]) -> str:
+    load_dotenv()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if key:
+        return key
+    raise SystemExit("缺少 OPENAI_API_KEY。请先双击「保存OpenAI密钥.command」保存你手动创建的 key。")
+
+
+def download_media_file(url: str, cfg: Dict[str, Any], platform: str) -> Path:
+    headers = dict(TEXT_HEADERS)
+    cookie = platform_cookie(cfg, platform)
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(url, headers=headers)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="content-asr-"))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            content_type = resp.headers.get_content_type() or "video/mp4"
+            ext = mimetypes.guess_extension(content_type) or ".mp4"
+            path = tmp_dir / ("media" + ext)
+            with path.open("wb") as f:
+                shutil.copyfileobj(resp, f)
+            return path
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def ffmpeg_path() -> str:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / "ffmpeg"
+    if fallback.exists():
+        return str(fallback)
+    raise RuntimeError("本机没有找到 ffmpeg，无法从视频抽取音频。")
+
+
+def extract_audio_file(media_path: Path) -> Path:
+    audio_path = media_path.parent / "audio.mp3"
+    cmd = [
+        ffmpeg_path(),
+        "-y",
+        "-i",
+        str(media_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        "48k",
+        str(audio_path),
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+        raise RuntimeError("ffmpeg 抽取音频失败：" + (result.stderr or "")[-500:])
+    return audio_path
+
+
+def multipart_mixed(parts: List[Dict[str, Any]]) -> Tuple[bytes, str]:
+    boundary = "----codex-" + uuid.uuid4().hex
+    chunks: List[bytes] = []
+    for part in parts:
+        chunks.append(f"--{boundary}\r\n".encode())
+        if "filename" in part:
+            chunks.append(
+                f'Content-Disposition: form-data; name="{part["name"]}"; filename="{part["filename"]}"\r\n'.encode()
+            )
+            chunks.append(f"Content-Type: {part.get('content_type') or 'application/octet-stream'}\r\n\r\n".encode())
+            chunks.append(part["data"])
+        else:
+            chunks.append(f'Content-Disposition: form-data; name="{part["name"]}"\r\n\r\n'.encode())
+            chunks.append(str(part.get("value", "")).encode("utf-8"))
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+def openai_transcribe_file(cfg: Dict[str, Any], path: Path) -> str:
+    api_key = load_openai_key(cfg)
+    openai_cfg = cfg.get("openai") or {}
+    parts = [
+        {"name": "model", "value": openai_cfg.get("transcribe_model") or "gpt-4o-transcribe"},
+        {"name": "response_format", "value": "json"},
+        {
+            "name": "file",
+            "filename": path.name,
+            "content_type": mimetypes.guess_type(str(path))[0] or "video/mp4",
+            "data": path.read_bytes(),
+        },
+    ]
+    if openai_cfg.get("language"):
+        parts.insert(1, {"name": "language", "value": openai_cfg["language"]})
+    body, boundary = multipart_mixed(parts)
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI 转写失败 HTTP {e.code}: {raw[:500]}")
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("OpenAI 转写返回为空")
+    return text
+
+
+def local_whisper_transcribe_file(cfg: Dict[str, Any], path: Path) -> str:
+    try:
+        import whisper  # type: ignore
+    except ImportError:
+        raise RuntimeError("本地 Whisper 未安装。请先运行「安装本地Whisper.command」。")
+    asr_cfg = cfg.get("asr") or {}
+    model_name = asr_cfg.get("local_model") or "base"
+    language = asr_cfg.get("language") or "zh"
+    model = whisper.load_model(model_name)
+    result = model.transcribe(
+        str(path),
+        language=language,
+        fp16=False,
+        initial_prompt=asr_cfg.get("initial_prompt") or None,
+        condition_on_previous_text=True,
+    )
+    text = str(result.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("本地 Whisper 转写返回为空")
+    if asr_cfg.get("format_transcript", True):
+        text = format_transcript_text(text)
+    return text
+
+
+def format_transcript_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return ""
+    if re.search(r"[。！？；：,.!?]", text):
+        text = re.sub(r"\s*([。！？；：,.!?])\s*", r"\1", text)
+        text = re.sub(r"([。！？])", r"\1\n", text)
+        return re.sub(r"\n{2,}", "\n", text).strip()
+
+    break_words = [
+        "大家好", "今天", "首先", "第一", "第二", "第三", "然后", "所以", "但是",
+        "其实", "因为", "如果", "比如", "最后", "总结一下", "说白了", "你会发现",
+    ]
+    for word in break_words:
+        text = text.replace(word, "。" + word)
+    text = text.lstrip("。")
+
+    chunks: List[str] = []
+    current = ""
+    for part in re.split(r"(。)", text):
+        if not part:
+            continue
+        current += part
+        if part == "。" or len(current) >= 80:
+            chunks.append(current.rstrip("。") + "。")
+            current = ""
+    if current:
+        chunks.append(current.rstrip("。") + "。")
+    return "\n".join(x.strip() for x in chunks if x.strip())
+
+
+def transcribe_audio_file(cfg: Dict[str, Any], path: Path) -> str:
+    backend = ((cfg.get("asr") or {}).get("backend") or "local").lower()
+    if backend == "openai":
+        return openai_transcribe_file(cfg, path)
+    if backend == "local":
+        return local_whisper_transcribe_file(cfg, path)
+    if backend == "auto":
+        try:
+            return local_whisper_transcribe_file(cfg, path)
+        except Exception as local_error:
+            try:
+                return openai_transcribe_file(cfg, path)
+            except Exception as openai_error:
+                raise RuntimeError(f"本地 Whisper 失败：{local_error}；OpenAI 失败：{openai_error}")
+    raise RuntimeError(f"未知 ASR backend：{backend}，可用值：local / openai / auto")
+
+
+def transcribe_from_meta(cfg: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    media_url = media_url_or_empty(meta)
+    if not media_url:
+        raise RuntimeError("未拿到视频/音频直链；需要平台登录 Cookie 或浏览器采集模式。")
+    path = download_media_file(media_url, cfg, meta.get("platform") or "")
+    try:
+        audio_path = extract_audio_file(path)
+        return transcribe_audio_file(cfg, audio_path)
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
 
 
 def meta_content(text: str, *names: str) -> str:
@@ -589,6 +892,13 @@ def extract_from_page(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
             share_text, share_final = fetch_text_optional(share_url, cfg, platform)
             if share_text:
                 meta = merge_meta(meta, extract_from_html(share_url, share_text, share_final, platform))
+    if not (meta.get("title") and (meta.get("media_url") or platform != "抖音")):
+        try:
+            meta = merge_meta(meta, extract_with_ytdlp(url, cfg))
+        except RuntimeError as e:
+            if not meta.get("title"):
+                raise
+            meta["yt_dlp_error"] = str(e)
     return meta
 
 
@@ -740,7 +1050,16 @@ def cmd_init_fields(_: argparse.Namespace) -> None:
 
 def cmd_test_url(args: argparse.Namespace) -> None:
     cfg = load_config()
-    meta = extract_from_page(normalize_url(args.url), cfg)
+    try:
+        meta = extract_from_page(normalize_url(args.url), cfg)
+    except Exception as e:
+        meta = {
+            "source_url": normalize_url(args.url),
+            "platform": detect_platform(normalize_url(args.url)),
+            "title": "",
+            "caption": "",
+            "error": str(e),
+        }
     print(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
@@ -764,9 +1083,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
     names = cfg["fields"]
     field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
     records = list_records(cfg)
-    done = skipped = failed = 0
+    done = skipped = failed = attempted = 0
     for record in records:
-        if args.limit and done >= args.limit:
+        if args.limit and attempted >= args.limit:
             break
         ok, url = should_process(record, cfg, args.all)
         if not ok:
@@ -827,6 +1146,97 @@ def cmd_clean_fake_transcripts(args: argparse.Namespace) -> None:
     print(f"完成：清空 {cleaned} 条，跳过 {skipped} 条", flush=True)
 
 
+def cmd_transcribe_url(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    meta = extract_from_page(normalize_url(args.url), cfg)
+    text = transcribe_from_meta(cfg, meta)
+    print(text)
+
+
+def cmd_transcribe_missing(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    names = cfg["fields"]
+    field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
+    records = list_records(cfg)
+    done = skipped = failed = attempted = 0
+    for record in records:
+        if args.limit and attempted >= args.limit:
+            break
+        fields = record.get("fields") or {}
+        url = normalize_url(as_text(fields.get(names["url"])))
+        caption = as_text(fields.get(names["caption"]))
+        if not url or (caption and not args.all):
+            skipped += 1
+            continue
+        attempted += 1
+        print(f"转写：{url}", flush=True)
+        try:
+            meta = extract_from_page(url, cfg)
+            text = transcribe_from_meta(cfg, meta)
+            update = keep_existing_fields({
+                names["caption"]: text,
+                names["status"]: "成功",
+                names["fetched_at"]: now_text(),
+                names["error"]: "",
+            }, field_types)
+            update_record(cfg, record["record_id"], update)
+            done += 1
+        except Exception as e:
+            failed += 1
+            update = keep_existing_fields({
+                names["status"]: "部分成功",
+                names["fetched_at"]: now_text(),
+                names["error"]: f"逐字稿转写未完成：{e}",
+            }, field_types)
+            try:
+                update_record(cfg, record["record_id"], update)
+            except Exception:
+                pass
+            print(f"失败：{e}", flush=True)
+    print(f"完成：转写 {done} 条，跳过 {skipped} 条，失败 {failed} 条", flush=True)
+
+
+def cmd_format_transcripts(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    names = cfg["fields"]
+    field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
+    records = list_records(cfg)
+    done = skipped = 0
+    for record in records:
+        if args.limit and done >= args.limit:
+            break
+        fields = record.get("fields") or {}
+        caption = as_text(fields.get(names["caption"]))
+        if not caption:
+            skipped += 1
+            continue
+        formatted = format_transcript_text(caption)
+        if formatted == caption:
+            skipped += 1
+            continue
+        update_record(cfg, record["record_id"], keep_existing_fields({
+            names["caption"]: formatted,
+            names["fetched_at"]: now_text(),
+        }, field_types))
+        done += 1
+    print(f"完成：格式化 {done} 条，跳过 {skipped} 条", flush=True)
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    print(f"开始监听飞书表格：每 {args.interval} 秒扫描一次。按 Ctrl+C 停止。", flush=True)
+    while True:
+        try:
+            cmd_sync(argparse.Namespace(limit=args.sync_limit, all=False))
+            cmd_transcribe_missing(argparse.Namespace(limit=args.transcribe_limit, all=False))
+        except KeyboardInterrupt:
+            print("已停止监听。", flush=True)
+            return
+        except Exception as e:
+            print(f"监听循环出错：{e}", flush=True)
+        time.sleep(args.interval)
+
+
 def cmd_make_config(_: argparse.Namespace) -> None:
     if CONFIG_PATH.exists():
         raise SystemExit(f"已存在 {CONFIG_PATH}，不覆盖。")
@@ -873,6 +1283,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("clean-fake-transcripts", help="清空与标题完全相同的伪逐字稿")
     s.set_defaults(fn=cmd_clean_fake_transcripts)
+
+    s = sub.add_parser("transcribe-url", help="测试单个链接的音频转写，不写飞书")
+    s.add_argument("url")
+    s.set_defaults(fn=cmd_transcribe_url)
+
+    s = sub.add_parser("transcribe-missing", help="转写飞书表格里文案为空的记录")
+    s.add_argument("--limit", type=int, default=0, help="最多处理几条，0 表示不限")
+    s.add_argument("--all", action="store_true", help="重转所有有链接的记录")
+    s.set_defaults(fn=cmd_transcribe_missing)
+
+    s = sub.add_parser("format-transcripts", help="给已有逐字稿做轻量标点和分段")
+    s.add_argument("--limit", type=int, default=0, help="最多处理几条，0 表示不限")
+    s.set_defaults(fn=cmd_format_transcripts)
+
+    s = sub.add_parser("watch", help="持续监听飞书表格新链接并自动抓取/转写")
+    s.add_argument("--interval", type=int, default=60, help="扫描间隔秒数")
+    s.add_argument("--sync-limit", type=int, default=20, help="每轮最多抓取元数据条数")
+    s.add_argument("--transcribe-limit", type=int, default=1, help="每轮最多转写条数")
+    s.set_defaults(fn=cmd_watch)
 
     return p
 
