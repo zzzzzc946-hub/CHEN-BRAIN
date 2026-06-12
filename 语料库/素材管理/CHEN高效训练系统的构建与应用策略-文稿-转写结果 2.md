@@ -1,6 +1,4 @@
 ---
-title: CHEN高效训练系统的构建与应用策略-文稿-转写结果 2
-source_file: CHEN高效训练系统的构建与应用策略-文稿-转写结果 2.txt
 converted: 2026-06-12
 tags:
   - inbox/md转换

@@ -1,6 +1,4 @@
 ---
-title: 优化选题提升内容质量-文稿-转写结果
-source_file: 优化选题提升内容质量-文稿-转写结果.txt
 converted: 2026-06-10
 tags:
   - inbox/md转换
