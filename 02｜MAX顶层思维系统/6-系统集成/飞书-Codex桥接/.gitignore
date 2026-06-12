@@ -1,4 +1,0 @@
-.env
-.feishu_token_cache.json
-__pycache__/
-*.pyc

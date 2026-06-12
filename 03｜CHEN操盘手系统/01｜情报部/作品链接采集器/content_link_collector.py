@@ -3,7 +3,7 @@
 """
 作品链接采集器
 
-把飞书多维表格第一列的抖音 / 小红书 / 视频号链接解析成标题、文案、封面、时长、
+把飞书多维表格第一列的抖音 / 小红书 / 视频号链接解析成标题、逐字稿、封面、时长、
 互动数和发布时间，再写回原记录。
 
 只使用 Python 标准库，便于直接双击或在本机 Terminal 运行。
@@ -66,6 +66,18 @@ FIELD_SPECS = [
     ("抓取状态", 1, None),
     ("抓取时间", 1, None),
     ("错误信息", 1, None),
+]
+
+TRANSCRIPT_KEYS = [
+    "transcript",
+    "subtitle",
+    "subtitles",
+    "captionText",
+    "caption_text",
+    "asrText",
+    "asr_text",
+    "voiceText",
+    "voice_text",
 ]
 
 TEXT_HEADERS = {
@@ -343,12 +355,13 @@ def extract_douyin_api(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     video = detail.get("video") or {}
     cover = video.get("cover") or video.get("origin_cover") or video.get("dynamic_cover") or {}
     desc = str(detail.get("desc") or "").strip()
+    transcript = pick_first_json(detail, TRANSCRIPT_KEYS)
     return {
         "source_url": url,
         "final_url": url,
         "platform": "抖音",
         "title": clean_title(desc[:120]),
-        "caption": desc,
+        "caption": str(transcript or "").strip(),
         "cover_url": first_url(cover),
         "duration": to_duration(video.get("duration")),
         "likes": to_int(stat.get("digg_count")),
@@ -506,14 +519,14 @@ def extract_from_html(url: str, text: str, final_url: str, platform: str) -> Dic
     platform = detect_platform(url)
     metas = {
         "title": meta_content(text, "og:title", "twitter:title", "title") or title_tag(text),
-        "caption": meta_content(text, "description", "og:description", "twitter:description"),
+        "description": meta_content(text, "description", "og:description", "twitter:description"),
         "cover_url": meta_content(text, "og:image", "twitter:image"),
     }
 
     found: Dict[str, Any] = {}
     for obj in iter_json_objects(text):
         title = pick_first_json(obj, ["title", "desc", "description", "noteTitle", "displayTitle"])
-        caption = pick_first_json(obj, ["desc", "description", "content", "noteContent", "shareDesc"])
+        transcript = pick_first_json(obj, TRANSCRIPT_KEYS)
         cover = pick_first_json(obj, ["cover", "coverUrl", "originCover", "dynamicCover", "image", "thumbnailUrl"])
         duration = pick_first_json(obj, ["duration", "durationMillis", "videoDuration"])
         likes = pick_first_json(obj, ["diggCount", "likedCount", "likes", "likeCount", "liked_count"])
@@ -522,8 +535,8 @@ def extract_from_html(url: str, text: str, final_url: str, platform: str) -> Dic
         published = pick_first_json(obj, ["createTime", "create_time", "publishTime", "time", "datePublished"])
         if title and not found.get("title"):
             found["title"] = title
-        if caption and not found.get("caption"):
-            found["caption"] = caption
+        if transcript and not found.get("caption"):
+            found["caption"] = transcript
         if cover and not found.get("cover_url"):
             found["cover_url"] = first_url(cover)
         if duration and not found.get("duration"):
@@ -538,9 +551,10 @@ def extract_from_html(url: str, text: str, final_url: str, platform: str) -> Dic
             found["published_at"] = to_time_text(published)
 
     title = clean_title(str(found.get("title") or metas["title"] or ""))
-    caption = str(found.get("caption") or metas["caption"] or "").strip()
-    if not title and caption:
-        title = caption[:80]
+    description = str(metas["description"] or "").strip()
+    caption = str(found.get("caption") or "").strip()
+    if not title and description:
+        title = description[:80]
 
     return {
         "source_url": url,
@@ -652,6 +666,10 @@ def upload_cover_to_feishu(cfg: Dict[str, Any], cover_url: str, platform: str) -
     return None
 
 
+def keep_existing_fields(fields: Dict[str, Any], field_types: Dict[str, int]) -> Dict[str, Any]:
+    return {k: v for k, v in fields.items() if k in field_types}
+
+
 def build_update_fields(cfg: Dict[str, Any], meta: Dict[str, Any], field_types: Dict[str, int]) -> Dict[str, Any]:
     names = cfg["fields"]
     out: Dict[str, Any] = {
@@ -680,16 +698,17 @@ def build_update_fields(cfg: Dict[str, Any], meta: Dict[str, Any], field_types: 
                 out[cover_name] = [{"file_token": token}]
         else:
             out[cover_name] = cover_url
-    return {k: v for k, v in out.items() if k and v is not None}
+    return keep_existing_fields({k: v for k, v in out.items() if k and v is not None}, field_types)
 
 
-def status_fields(cfg: Dict[str, Any], status: str, error: str) -> Dict[str, Any]:
+def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     names = cfg["fields"]
-    return {
+    fields = {
         names["status"]: status,
         names["fetched_at"]: now_text(),
         names["error"]: error[:1000],
     }
+    return keep_existing_fields(fields, field_types) if field_types is not None else fields
 
 
 def cmd_auth_test(_: argparse.Namespace) -> None:
@@ -756,24 +775,56 @@ def cmd_sync(args: argparse.Namespace) -> None:
         record_id = record.get("record_id")
         if not record_id:
             continue
-        print(f"抓取：{url}")
+        print(f"抓取：{url}", flush=True)
         try:
             meta = extract_from_page(url, cfg)
             update_fields = build_update_fields(cfg, meta, field_types)
-            if not meta.get("title") and not meta.get("caption"):
-                update_fields.update(status_fields(cfg, "部分成功", "已访问链接，但页面没有暴露标题/文案；可能需要登录 cookie 或官方接口。"))
-            update_record(cfg, record_id, update_fields)
+            if not meta.get("title"):
+                update_fields.update(status_fields(cfg, "部分成功", "已访问链接，但页面没有暴露标题；可能需要登录 cookie 或官方接口。", field_types))
+            elif not meta.get("caption"):
+                update_fields.update(status_fields(cfg, "部分成功", "已抓到作品信息，但未抓到视频逐字稿；需要字幕/ASR能力。", field_types))
+            if update_fields:
+                update_record(cfg, record_id, update_fields)
             done += 1
         except Exception as e:
             failed += 1
             try:
-                update_record(cfg, record_id, status_fields(cfg, "失败", str(e)))
+                fields = status_fields(cfg, "失败", str(e), field_types)
+                if fields:
+                    update_record(cfg, record_id, fields)
             except Exception:
                 pass
-            print(f"失败：{e}")
-    print(f"完成：处理 {done} 条，跳过 {skipped} 条，失败 {failed} 条")
+            print(f"失败：{e}", flush=True)
+    print(f"完成：处理 {done} 条，跳过 {skipped} 条，失败 {failed} 条", flush=True)
     if names.get("cover") == "封面":
         print("提示：如果你的「封面」字段是附件字段但没有显示图片，请先看「封面图链接」字段。")
+
+
+def cmd_clean_fake_transcripts(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    names = cfg["fields"]
+    field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
+    if names["caption"] not in field_types:
+        raise SystemExit(f"表里没有字段：{names['caption']}")
+    records = list_records(cfg)
+    cleaned = skipped = 0
+    for record in records:
+        fields = record.get("fields") or {}
+        title = as_text(fields.get(names["title"]))
+        caption = as_text(fields.get(names["caption"]))
+        if title and caption and title == caption:
+            update = keep_existing_fields({
+                names["caption"]: "",
+                names["status"]: "部分成功",
+                names["fetched_at"]: now_text(),
+                names["error"]: "已清空错误文案：原内容只是作品标题/描述，不是视频逐字稿。",
+            }, field_types)
+            update_record(cfg, record["record_id"], update)
+            cleaned += 1
+            print(f"清空：{title[:60]}", flush=True)
+        else:
+            skipped += 1
+    print(f"完成：清空 {cleaned} 条，跳过 {skipped} 条", flush=True)
 
 
 def cmd_make_config(_: argparse.Namespace) -> None:
@@ -819,6 +870,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=0, help="最多处理几条，0 表示不限")
     s.add_argument("--all", action="store_true", help="重新处理所有有链接的记录")
     s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("clean-fake-transcripts", help="清空与标题完全相同的伪逐字稿")
+    s.set_defaults(fn=cmd_clean_fake_transcripts)
 
     return p
 
