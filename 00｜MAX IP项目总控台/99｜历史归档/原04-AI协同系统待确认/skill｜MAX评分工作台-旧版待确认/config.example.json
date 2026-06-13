@@ -1,8 +1,0 @@
-{
-  "feishu": {
-    "app_id": "cli_在这里填AppID",
-    "app_secret": "在这里填AppSecret",
-    "app_token": "bascn开头的多维表格token",
-    "table_id": "tbl开头的数据表id"
-  }
-}
