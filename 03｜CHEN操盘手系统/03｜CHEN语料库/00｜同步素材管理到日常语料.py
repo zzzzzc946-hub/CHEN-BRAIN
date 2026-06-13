@@ -7,8 +7,7 @@ from pathlib import Path
 import re
 
 
-VAULT_ROOT = Path(os.environ.get("CHEN_BRAIN_ROOT", Path(__file__).resolve().parents[1]))
-CORPUS_DIR = VAULT_ROOT / "语料库"
+CORPUS_DIR = Path(os.environ.get("CHEN_BRAIN_CORPUS_DIR", Path(__file__).resolve().parent))
 MATERIALS_DIR = CORPUS_DIR / "素材管理"
 TARGET = CORPUS_DIR / "日常语料逐字稿合集.md"
 MARKER = "<!-- 素材管理语料合并区 -->"
@@ -69,7 +68,7 @@ def rebuild() -> None:
         "",
         f"生成日期：{datetime.now().strftime('%Y-%m-%d')}",
         "",
-        "合并范围：`语料库/素材管理/` 下当前全部 Markdown 语料文档。",
+        "合并范围：`03｜CHEN操盘手系统/03｜CHEN语料库/素材管理/` 下当前全部 Markdown 语料文档。",
         "",
         "说明：本区每份素材文档都是同级一级标题；素材内部原有标题统一降一级，避免在 Obsidian 大纲里变成其他文档的子集。",
         "",
@@ -82,7 +81,7 @@ def rebuild() -> None:
                 "",
                 f"# {index:02d}｜{path.stem}",
                 "",
-                f"来源文件：`语料库/素材管理/{path.name}`",
+                f"来源文件：`03｜CHEN操盘手系统/03｜CHEN语料库/素材管理/{path.name}`",
                 "",
                 "---",
                 "",
