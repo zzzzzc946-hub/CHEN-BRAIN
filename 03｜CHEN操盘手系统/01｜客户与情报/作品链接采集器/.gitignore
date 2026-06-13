@@ -4,3 +4,5 @@ config.json
 cookies.txt
 logs/
 __pycache__/
+cloudflared
+cloudflared-*.tgz

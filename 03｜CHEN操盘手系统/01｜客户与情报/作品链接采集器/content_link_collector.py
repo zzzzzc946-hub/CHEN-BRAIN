@@ -13,14 +13,17 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import html
+import http.server
 import json
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -267,6 +270,12 @@ def list_records(cfg: Dict[str, Any], page_size: int = 100) -> List[Dict[str, An
         page_token = data.get("page_token") or ""
         if not page_token:
             return items
+
+
+def get_record(cfg: Dict[str, Any], record_id: str) -> Dict[str, Any]:
+    endpoint = records_endpoint(cfg) + "/" + urllib.parse.quote(record_id)
+    payload = feishu_api(cfg, "GET", endpoint)
+    return (payload.get("data") or {}).get("record") or {}
 
 
 def update_record(cfg: Dict[str, Any], record_id: str, fields: Dict[str, Any]) -> None:
@@ -1031,6 +1040,71 @@ def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Opt
     return keep_existing_fields(fields, field_types) if field_types is not None else fields
 
 
+def challenge_response(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    challenge = payload.get("challenge")
+    if isinstance(challenge, str) and challenge:
+        return {"challenge": challenge}
+    return None
+
+
+def extract_record_ids(payload: Any) -> List[str]:
+    found: List[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and re.fullmatch(r"rec[A-Za-z0-9_-]{8,}", value) and value not in found:
+            found.append(value)
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                if child_key in {"record_id", "recordId"}:
+                    add(child_value)
+                walk(child_value, child_key)
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item, key)
+            return
+        if key in {"record_id", "recordId"}:
+            add(value)
+
+    walk(payload)
+    return found
+
+
+def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dict[str, int], transcribe: bool = True) -> str:
+    names = cfg["fields"]
+    record_id = record.get("record_id") or record.get("id") or ""
+    fields = record.get("fields") or {}
+    url = normalize_url(as_text(fields.get(names["url"])))
+    if not record_id:
+        raise RuntimeError("飞书事件没有 record_id。")
+    if not url:
+        update_record(cfg, record_id, status_fields(cfg, "跳过", "作品链接为空。", field_types))
+        return "skipped"
+
+    meta = extract_from_page(url, cfg)
+    update_fields = build_update_fields(cfg, meta, field_types)
+    if not meta.get("title"):
+        update_fields.update(status_fields(cfg, "部分成功", "已访问链接，但页面没有暴露标题；可能需要登录 cookie 或官方接口。", field_types))
+    elif not meta.get("caption"):
+        update_fields.update(status_fields(cfg, "部分成功", "已抓到作品信息，但未抓到视频逐字稿；需要字幕/ASR能力。", field_types))
+    if update_fields:
+        update_record(cfg, record_id, update_fields)
+
+    existing_caption = as_text(fields.get(names["caption"]))
+    if transcribe and not existing_caption and not meta.get("caption"):
+        text = transcribe_from_meta(cfg, meta)
+        update_record(cfg, record_id, keep_existing_fields({
+            names["caption"]: text,
+            names["status"]: "成功",
+            names["fetched_at"]: now_text(),
+            names["error"]: "",
+        }, field_types))
+        return "transcribed"
+    return "synced"
+
+
 def cmd_auth_test(_: argparse.Namespace) -> None:
     cfg = load_config()
     token = tenant_access_token(cfg, force=True)
@@ -1240,6 +1314,122 @@ def cmd_format_transcripts(args: argparse.Namespace) -> None:
     print(f"完成：格式化 {done} 条，跳过 {skipped} 条", flush=True)
 
 
+def webhook_worker(cfg: Dict[str, Any], jobs: "queue.Queue[str]", stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            record_id = jobs.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            print(f"Webhook处理：{record_id}", flush=True)
+            field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
+            record = get_record(cfg, record_id)
+            if not record:
+                raise RuntimeError(f"未找到记录：{record_id}")
+            result = process_record(record, cfg, field_types, transcribe=True)
+            print(f"Webhook完成：{record_id} -> {result}", flush=True)
+        except Exception as e:
+            print(f"Webhook失败：{record_id} -> {e}", flush=True)
+            try:
+                field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
+                update_record(cfg, record_id, status_fields(cfg, "失败", str(e), field_types))
+            except Exception:
+                pass
+        finally:
+            jobs.task_done()
+
+
+def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
+    pending: set[str] = set()
+    pending_lock = threading.Lock()
+    webhook_cfg = cfg.get("webhook") or {}
+    verification_token = webhook_cfg.get("verification_token") or ""
+
+    class FeishuWebhookHandler(http.server.BaseHTTPRequestHandler):
+        server_version = "ChenFeishuWebhook/1.0"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            print(f"Webhook请求：{self.address_string()} - {fmt % args}", flush=True)
+
+        def write_json(self, status: int, payload: Dict[str, Any]) -> None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            if urllib.parse.urlparse(self.path).path in {"/", "/health"}:
+                self.write_json(200, {"ok": True, "service": "feishu-webhook"})
+                return
+            self.write_json(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self) -> None:
+            path = urllib.parse.urlparse(self.path).path
+            if path not in {"/", "/feishu/webhook"}:
+                self.write_json(404, {"ok": False, "error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8") if raw else "{}")
+            except json.JSONDecodeError:
+                self.write_json(400, {"ok": False, "error": "invalid json"})
+                return
+
+            challenge = challenge_response(payload)
+            if challenge:
+                self.write_json(200, challenge)
+                return
+
+            if verification_token:
+                got = payload.get("token") or (payload.get("header") or {}).get("token") or self.headers.get("X-Lark-Request-Token") or ""
+                if got != verification_token:
+                    self.write_json(403, {"ok": False, "error": "bad token"})
+                    return
+
+            record_ids = extract_record_ids(payload)
+            queued: List[str] = []
+            with pending_lock:
+                for record_id in record_ids:
+                    if record_id in pending:
+                        continue
+                    pending.add(record_id)
+                    jobs.put(record_id)
+                    queued.append(record_id)
+
+            def clear_pending() -> None:
+                jobs.join()
+                with pending_lock:
+                    for record_id in queued:
+                        pending.discard(record_id)
+
+            if queued:
+                threading.Thread(target=clear_pending, daemon=True).start()
+            self.write_json(200, {"ok": True, "queued": queued})
+
+    return FeishuWebhookHandler
+
+
+def cmd_webhook_server(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    jobs: "queue.Queue[str]" = queue.Queue()
+    stop_event = threading.Event()
+    worker = threading.Thread(target=webhook_worker, args=(cfg, jobs, stop_event), daemon=True)
+    worker.start()
+    server = http.server.ThreadingHTTPServer((args.host, args.port), make_webhook_handler(cfg, jobs))
+    print(f"飞书 Webhook 服务已启动：http://{args.host}:{args.port}/feishu/webhook", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("正在停止飞书 Webhook 服务。", flush=True)
+    finally:
+        stop_event.set()
+        server.shutdown()
+        server.server_close()
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     cfg = load_config()
     print(f"开始监听飞书表格：每 {args.interval} 秒扫描一次。按 Ctrl+C 停止。", flush=True)
@@ -1314,6 +1504,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("format-transcripts", help="给已有逐字稿做轻量标点和分段")
     s.add_argument("--limit", type=int, default=0, help="最多处理几条，0 表示不限")
     s.set_defaults(fn=cmd_format_transcripts)
+
+    s = sub.add_parser("webhook-server", help="启动飞书事件 Webhook 服务")
+    s.add_argument("--host", default="127.0.0.1", help="监听地址")
+    s.add_argument("--port", type=int, default=8787, help="监听端口")
+    s.set_defaults(fn=cmd_webhook_server)
 
     s = sub.add_parser("watch", help="持续监听飞书表格新链接并自动抓取/转写")
     s.add_argument("--interval", type=int, default=60, help="扫描间隔秒数")

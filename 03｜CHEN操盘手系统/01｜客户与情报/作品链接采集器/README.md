@@ -98,13 +98,61 @@ python3 content_link_collector.py sync --limit 3
 python3 content_link_collector.py sync --all
 ```
 
-## 4. 平台限制
+## 4. Webhook 自动化模式
+
+轮询模式会每隔一段时间扫表。Webhook 模式更适合长期自动化：你在飞书新增或修改作品链接后，飞书事件会立刻通知本机 Worker，Worker 只处理这一条记录并写回结果。
+
+本机启动 Webhook 服务：
+
+```bash
+python3 content_link_collector.py webhook-server --host 127.0.0.1 --port 8787
+```
+
+也可以双击：
+
+```text
+启动飞书Webhook服务.command
+```
+
+Cloudflare Tunnel 暴露公网地址：
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8787
+```
+
+也可以双击：
+
+```text
+启动Cloudflare隧道.command
+```
+
+Cloudflare 会输出一个 `https://...trycloudflare.com` 地址。在飞书开放平台的事件订阅里填写：
+
+```text
+https://...trycloudflare.com/feishu/webhook
+```
+
+飞书 URL verification 会收到：
+
+```json
+{"challenge": "xxx"}
+```
+
+服务会返回：
+
+```json
+{"challenge": "xxx"}
+```
+
+收到真实记录事件后，服务会从事件里提取 `record_id`，后台队列处理对应一行。Webhook 请求会先快速返回，视频下载和本地 Whisper 转写在后台慢慢完成。
+
+## 5. 平台限制
 
 抖音公开网页通常最容易解析。小红书和视频号经常需要登录态，公开页面可能不暴露点赞、评论、分享、发布时间。
 
 如果某个平台显示“部分成功”或“失败”，把浏览器里的登录 Cookie 填到 `config.json` 对应平台的 `cookie` 里再重试。Cookie 属于敏感信息，不要发给别人，也不要提交到 Git。
 
-## 5. 封面字段说明
+## 6. 封面字段说明
 
 如果「封面」是文本字段，工具会写入封面图 URL。
 
