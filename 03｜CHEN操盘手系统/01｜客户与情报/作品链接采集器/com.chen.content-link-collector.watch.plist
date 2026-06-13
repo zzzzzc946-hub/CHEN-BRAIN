@@ -18,7 +18,7 @@
     <string>--sync-limit</string>
     <string>20</string>
     <string>--transcribe-limit</string>
-    <string>1</string>
+    <string>3</string>
   </array>
 
   <key>EnvironmentVariables</key>

@@ -1177,8 +1177,13 @@ def cmd_transcribe_missing(args: argparse.Namespace) -> None:
             break
         fields = record.get("fields") or {}
         url = normalize_url(as_text(fields.get(names["url"])))
+        title = as_text(fields.get(names["title"]))
         caption = as_text(fields.get(names["caption"]))
+        error = as_text(fields.get(names["error"]))
         if not url or (caption and not args.all):
+            skipped += 1
+            continue
+        if not args.all and not title and "Cookie" in error:
             skipped += 1
             continue
         attempted += 1
