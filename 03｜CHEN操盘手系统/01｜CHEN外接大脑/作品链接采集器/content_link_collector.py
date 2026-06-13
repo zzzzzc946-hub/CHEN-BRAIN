@@ -1380,6 +1380,7 @@ def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
 
             challenge = challenge_response(payload)
             if challenge:
+                print("Webhook验证：已返回 challenge", flush=True)
                 self.write_json(200, challenge)
                 return
 
@@ -1390,6 +1391,7 @@ def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
                     return
 
             record_ids = extract_record_ids(payload)
+            print(f"Webhook事件：record_ids={record_ids}", flush=True)
             queued: List[str] = []
             with pending_lock:
                 for record_id in record_ids:
