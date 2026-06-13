@@ -463,6 +463,8 @@ def extract_with_ytdlp(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     if result.returncode != 0 or not result.stdout.strip():
         err = (result.stderr or "").strip()
         if "Fresh cookies" in err or "cookies" in err.lower():
+            if cookies_from_browser:
+                raise RuntimeError(f"yt-dlp 已读取 {cookies_from_browser} 浏览器 Cookie，但抖音要求刷新登录态。请在浏览器里重新打开/登录抖音后再试。")
             raise RuntimeError("yt-dlp 需要登录 Cookie；请配置 cookies.txt 或 cookies_from_browser。")
         return {}
     payload = json.loads(result.stdout.splitlines()[-1])
