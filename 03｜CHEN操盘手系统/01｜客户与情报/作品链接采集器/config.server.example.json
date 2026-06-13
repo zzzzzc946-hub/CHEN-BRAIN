@@ -1,0 +1,45 @@
+{
+  "feishu": {
+    "app_id": "cli_在这里填AppID",
+    "app_secret": "在这里填AppSecret",
+    "app_token": "飞书多维表格URL里的 app_token",
+    "table_id": "飞书多维表格URL里的 table_id",
+    "base_url": "https://open.feishu.cn"
+  },
+  "fields": {
+    "url": "作品链接",
+    "platform": "平台",
+    "title": "作品标题",
+    "caption": "文案",
+    "cover": "封面",
+    "cover_url": "封面图链接",
+    "duration": "时长",
+    "likes": "点赞",
+    "comments": "评论",
+    "shares": "分享",
+    "published_at": "发布时间",
+    "status": "抓取状态",
+    "fetched_at": "抓取时间",
+    "error": "错误信息"
+  },
+  "platforms": {
+    "抖音": {"cookie": ""},
+    "小红书": {"cookie": ""},
+    "视频号": {"cookie": ""}
+  },
+  "yt_dlp": {
+    "enabled": true,
+    "cookies_file": "/app/cookies.txt",
+    "cookies_from_browser": ""
+  },
+  "asr": {
+    "backend": "local",
+    "local_model": "small",
+    "language": "zh",
+    "initial_prompt": "以下是中文短视频口播逐字稿，请保留自然的中文标点、英文专有名词和段落。",
+    "format_transcript": true
+  },
+  "webhook": {
+    "verification_token": ""
+  }
+}

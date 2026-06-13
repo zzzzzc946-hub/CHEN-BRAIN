@@ -1,0 +1,16 @@
+services:
+  content-link-collector:
+    build: .
+    container_name: chen-content-link-collector
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./cookies.txt:/app/cookies.txt:ro
+      - whisper-cache:/root/.cache/whisper
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+
+volumes:
+  whisper-cache:

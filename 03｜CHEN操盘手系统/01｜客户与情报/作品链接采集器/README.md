@@ -146,13 +146,119 @@ https://...trycloudflare.com/feishu/webhook
 
 收到真实记录事件后，服务会从事件里提取 `record_id`，后台队列处理对应一行。Webhook 请求会先快速返回，视频下载和本地 Whisper 转写在后台慢慢完成。
 
-## 5. 平台限制
+## 5. 服务器部署版
+
+服务器版适合长期使用：飞书直接请求服务器，不依赖本机网络、VPN、睡眠状态或 Cloudflare 临时隧道。
+
+### 服务器要求
+
+- Linux 服务器
+- Docker 和 Docker Compose
+- 开放入站端口 `8787`
+- 建议至少 `2C4G`；本地 Whisper `small` 模型会占用 CPU 和内存，视频越长越慢
+
+### 部署文件
+
+服务器部署相关文件：
+
+```text
+Dockerfile
+docker-compose.yml
+requirements-server.txt
+config.server.example.json
+chen-content-link-collector.service.example
+```
+
+### 部署步骤
+
+在服务器上创建目录：
+
+```bash
+sudo mkdir -p /opt/chen-content-link-collector
+sudo chown "$USER":"$USER" /opt/chen-content-link-collector
+```
+
+上传本目录里的部署文件和 `content_link_collector.py` 到：
+
+```text
+/opt/chen-content-link-collector
+```
+
+复制配置：
+
+```bash
+cd /opt/chen-content-link-collector
+cp config.server.example.json config.json
+```
+
+编辑 `config.json`，填入：
+
+- `feishu.app_id`
+- `feishu.app_secret`
+- `feishu.app_token`
+- `feishu.table_id`
+
+如果需要处理受限抖音链接，把浏览器导出的 Netscape 格式 Cookie 放到：
+
+```text
+/opt/chen-content-link-collector/cookies.txt
+```
+
+启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+看日志：
+
+```bash
+docker compose logs -f content-link-collector
+```
+
+测试健康检查：
+
+```bash
+curl http://服务器IP:8787/health
+```
+
+飞书事件订阅 URL 填：
+
+```text
+http://服务器IP:8787/feishu/webhook
+```
+
+如果服务器有域名和 HTTPS 反向代理，建议填：
+
+```text
+https://你的域名/feishu/webhook
+```
+
+### 开机自启
+
+复制 systemd 示例：
+
+```bash
+sudo cp chen-content-link-collector.service.example /etc/systemd/system/chen-content-link-collector.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now chen-content-link-collector
+```
+
+查看状态：
+
+```bash
+sudo systemctl status chen-content-link-collector
+```
+
+## 6. 平台限制
 
 抖音公开网页通常最容易解析。小红书和视频号经常需要登录态，公开页面可能不暴露点赞、评论、分享、发布时间。
 
 如果某个平台显示“部分成功”或“失败”，把浏览器里的登录 Cookie 填到 `config.json` 对应平台的 `cookie` 里再重试。Cookie 属于敏感信息，不要发给别人，也不要提交到 Git。
 
-## 6. 封面字段说明
+服务器不能直接读取你 Mac 浏览器里的 Edge/Chrome 登录态；服务器要处理受限链接，需要上传 `cookies.txt` 或接入稳定的数据接口。
+
+## 7. 封面字段说明
 
 如果「封面」是文本字段，工具会写入封面图 URL。
 
