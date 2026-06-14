@@ -1072,6 +1072,17 @@ def extract_record_ids(payload: Any) -> List[str]:
     return found
 
 
+def extract_bitable_action_record_ids(event: Any) -> List[str]:
+    found: List[str] = []
+    event_data = getattr(event, "event", None)
+    action_list = getattr(event_data, "action_list", None) or []
+    for action in action_list:
+        record_id = getattr(action, "record_id", None)
+        if isinstance(record_id, str) and record_id and record_id not in found:
+            found.append(record_id)
+    return found
+
+
 def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dict[str, int], transcribe: bool = True) -> str:
     names = cfg["fields"]
     record_id = record.get("record_id") or record.get("id") or ""
@@ -1432,6 +1443,47 @@ def cmd_webhook_server(args: argparse.Namespace) -> None:
         server.server_close()
 
 
+def cmd_event_listener(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    feishu = require_feishu_credentials(cfg)
+    jobs: "queue.Queue[str]" = queue.Queue()
+    stop_event = threading.Event()
+    worker = threading.Thread(target=webhook_worker, args=(cfg, jobs, stop_event), daemon=True)
+    worker.start()
+
+    try:
+        import lark_oapi as lark
+        from lark_oapi.api.drive.v1 import P2DriveFileBitableRecordChangedV1
+        from lark_oapi.ws import Client as LarkWsClient
+    except ImportError as e:
+        raise SystemExit("缺少飞书官方 SDK：请先运行 python3 -m pip install --user -U lark-oapi") from e
+
+    def on_bitable_record_changed(event: Any) -> None:
+        record_ids = extract_bitable_action_record_ids(event)
+        print(f"长连接事件：record_ids={record_ids}", flush=True)
+        for record_id in record_ids:
+            jobs.put(record_id)
+
+    event_handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_drive_file_bitable_record_changed_v1(on_bitable_record_changed)
+        .build()
+    )
+    client = LarkWsClient(
+        feishu["app_id"],
+        feishu["app_secret"],
+        event_handler=event_handler,
+        domain=base_url(feishu),
+    )
+    print("飞书长连接监听已启动。按 Ctrl+C 停止。", flush=True)
+    try:
+        client.start()
+    except KeyboardInterrupt:
+        print("正在停止飞书长连接监听。", flush=True)
+    finally:
+        stop_event.set()
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     cfg = load_config()
     print(f"开始监听飞书表格：每 {args.interval} 秒扫描一次。按 Ctrl+C 停止。", flush=True)
@@ -1511,6 +1563,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", default="127.0.0.1", help="监听地址")
     s.add_argument("--port", type=int, default=8787, help="监听端口")
     s.set_defaults(fn=cmd_webhook_server)
+
+    s = sub.add_parser("event-listener", help="启动飞书长连接事件监听")
+    s.set_defaults(fn=cmd_event_listener)
 
     s = sub.add_parser("watch", help="持续监听飞书表格新链接并自动抓取/转写")
     s.add_argument("--interval", type=int, default=60, help="扫描间隔秒数")

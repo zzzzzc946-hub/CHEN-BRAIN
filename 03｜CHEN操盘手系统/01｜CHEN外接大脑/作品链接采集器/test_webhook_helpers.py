@@ -38,6 +38,24 @@ class WebhookHelperTests(unittest.TestCase):
             {"challenge": "abc123"},
         )
 
+    def test_extract_bitable_action_record_ids_from_sdk_event(self):
+        collector = load_collector()
+
+        class Action:
+            def __init__(self, record_id):
+                self.record_id = record_id
+
+        class EventData:
+            action_list = [Action("recSdkRecord123"), Action("recSdkRecord456")]
+
+        class SdkEvent:
+            event = EventData()
+
+        self.assertEqual(
+            collector.extract_bitable_action_record_ids(SdkEvent()),
+            ["recSdkRecord123", "recSdkRecord456"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
