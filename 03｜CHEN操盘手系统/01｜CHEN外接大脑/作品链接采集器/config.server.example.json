@@ -39,6 +39,10 @@
     "initial_prompt": "以下是中文短视频口播逐字稿，请保留自然的中文标点、英文专有名词和段落。",
     "format_transcript": true
   },
+  "event": {
+    "encrypt_key": "",
+    "verification_token": ""
+  },
   "webhook": {
     "verification_token": ""
   }

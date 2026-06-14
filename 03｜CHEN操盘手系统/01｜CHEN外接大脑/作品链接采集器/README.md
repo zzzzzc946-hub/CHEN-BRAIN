@@ -41,7 +41,7 @@
 复制配置样例：
 
 ```bash
-cd "03｜CHEN操盘手系统/01｜客户与情报/作品链接采集器"
+cd "03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器"
 cp config.example.json config.json
 ```
 
@@ -98,7 +98,60 @@ python3 content_link_collector.py sync --limit 3
 python3 content_link_collector.py sync --all
 ```
 
-## 4. Webhook 自动化模式
+## 4. 长连接自动化模式（主方案）
+
+长连接模式是当前推荐方案：本机程序主动连接飞书开放平台，飞书不需要访问你的公网 URL，也不会再受 localtunnel / Cloudflare 临时地址变化影响。
+
+先安装飞书官方 SDK：
+
+```bash
+python3 -m pip install --user -U lark-oapi
+```
+
+启动长连接监听：
+
+```bash
+python3 content_link_collector.py event-listener
+```
+
+也可以双击：
+
+```text
+启动飞书长连接监听.command
+```
+
+飞书开放平台里保持：
+
+```text
+使用 长连接 接收事件
+```
+
+已添加事件建议保留：
+
+```text
+多维表格记录新增
+多维表格记录变更
+```
+
+本地监听启动后，在飞书开放平台点击「重新验证」。验证成功后，你在多维表格新增或修改作品链接，长连接客户端会收到 `record_id`，然后复用同一套后台逻辑：
+
+```text
+record_id -> 读取飞书记录 -> 抓取作品信息 -> 本地 Whisper 转写音频 -> 写回飞书
+```
+
+如果需要把监听做成 Mac 常驻服务，使用本目录里的：
+
+```text
+com.chen.content-link-collector.event-listener.plist
+```
+
+常驻服务的工作目录是：
+
+```text
+/Users/chen.zip/Library/Application Support/ChenContentLinkCollector
+```
+
+## 5. Webhook 自动化模式（备用）
 
 轮询模式会每隔一段时间扫表。Webhook 模式更适合长期自动化：你在飞书新增或修改作品链接后，飞书事件会立刻通知本机 Worker，Worker 只处理这一条记录并写回结果。
 
@@ -164,7 +217,7 @@ https://...loca.lt/feishu/webhook
 
 收到真实记录事件后，服务会从事件里提取 `record_id`，后台队列处理对应一行。Webhook 请求会先快速返回，视频下载和本地 Whisper 转写在后台慢慢完成。
 
-## 5. 服务器部署版
+## 6. 服务器部署版
 
 服务器版适合长期使用：飞书直接请求服务器，不依赖本机网络、VPN、睡眠状态或 Cloudflare 临时隧道。
 
@@ -268,7 +321,7 @@ sudo systemctl enable --now chen-content-link-collector
 sudo systemctl status chen-content-link-collector
 ```
 
-## 6. 平台限制
+## 7. 平台限制
 
 抖音公开网页通常最容易解析。小红书和视频号经常需要登录态，公开页面可能不暴露点赞、评论、分享、发布时间。
 
@@ -276,7 +329,7 @@ sudo systemctl status chen-content-link-collector
 
 服务器不能直接读取你 Mac 浏览器里的 Edge/Chrome 登录态；服务器要处理受限链接，需要上传 `cookies.txt` 或接入稳定的数据接口。
 
-## 7. 封面字段说明
+## 8. 封面字段说明
 
 如果「封面」是文本字段，工具会写入封面图 URL。
 

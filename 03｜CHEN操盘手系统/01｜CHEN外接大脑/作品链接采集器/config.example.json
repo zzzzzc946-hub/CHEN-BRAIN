@@ -32,5 +32,9 @@
     "视频号": {
       "cookie": ""
     }
+  },
+  "event": {
+    "encrypt_key": "",
+    "verification_token": ""
   }
 }

@@ -137,6 +137,11 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg.setdefault("openai", {})
     cfg["openai"].setdefault("transcribe_model", "gpt-4o-transcribe")
     cfg["openai"].setdefault("language", "zh")
+    cfg.setdefault("webhook", {})
+    cfg["webhook"].setdefault("verification_token", "")
+    cfg.setdefault("event", {})
+    cfg["event"].setdefault("encrypt_key", "")
+    cfg["event"].setdefault("verification_token", cfg["webhook"].get("verification_token", ""))
     return cfg
 
 
@@ -1453,10 +1458,13 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
 
     try:
         import lark_oapi as lark
-        from lark_oapi.api.drive.v1 import P2DriveFileBitableRecordChangedV1
         from lark_oapi.ws import Client as LarkWsClient
     except ImportError as e:
         raise SystemExit("缺少飞书官方 SDK：请先运行 python3 -m pip install --user -U lark-oapi") from e
+
+    event_cfg = cfg.get("event") or {}
+    encrypt_key = event_cfg.get("encrypt_key") or ""
+    verification_token = event_cfg.get("verification_token") or ""
 
     def on_bitable_record_changed(event: Any) -> None:
         record_ids = extract_bitable_action_record_ids(event)
@@ -1465,7 +1473,7 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
             jobs.put(record_id)
 
     event_handler = (
-        lark.EventDispatcherHandler.builder("", "")
+        lark.EventDispatcherHandler.builder(encrypt_key, verification_token)
         .register_p2_drive_file_bitable_record_changed_v1(on_bitable_record_changed)
         .build()
     )
@@ -1515,6 +1523,10 @@ def cmd_make_config(_: argparse.Namespace) -> None:
             "抖音": {"cookie": ""},
             "小红书": {"cookie": ""},
             "视频号": {"cookie": ""},
+        },
+        "event": {
+            "encrypt_key": "",
+            "verification_token": "",
         },
     }
     CONFIG_PATH.write_text(json.dumps(example, ensure_ascii=False, indent=2), encoding="utf-8")
