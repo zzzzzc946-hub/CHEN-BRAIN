@@ -4,13 +4,13 @@
   "switcher": true,
   "graph": true,
   "backlink": true,
-  "canvas": true,
-  "outgoing-link": true,
+  "canvas": false,
+  "outgoing-link": false,
   "tag-pane": true,
   "footnotes": false,
   "properties": true,
   "page-preview": true,
-  "daily-notes": true,
+  "daily-notes": false,
   "templates": true,
   "note-composer": true,
   "command-palette": true,
@@ -19,7 +19,7 @@
   "bookmarks": true,
   "markdown-importer": false,
   "zk-prefixer": false,
-  "random-note": false,
+  "random-note": true,
   "outline": true,
   "word-count": true,
   "slides": false,
@@ -29,5 +29,5 @@
   "publish": false,
   "sync": true,
   "bases": true,
-  "webviewer": false
+  "webviewer": true
 }

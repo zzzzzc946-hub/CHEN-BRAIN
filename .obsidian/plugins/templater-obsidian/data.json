@@ -1,6 +1,6 @@
 {
   "command_timeout": 5,
-  "templates_folder": "00_System/Templates",
+  "templates_folder": "00｜MAX IP项目总控台/05｜Obsidian-Codex桥接/Templates",
   "templates_pairs": [
     [
       "",
@@ -9,9 +9,9 @@
   ],
   "trigger_on_file_creation": false,
   "auto_jump_to_cursor": true,
-  "enable_system_commands": false,
-  "shell_path": "",
-  "user_scripts_folder": "00_System/Scripts",
+  "enable_system_commands": true,
+  "shell_path": "/bin/zsh",
+  "user_scripts_folder": "00｜MAX IP项目总控台/05｜Obsidian-Codex桥接/Scripts",
   "enable_folder_templates": true,
   "folder_templates": [
     {
@@ -41,10 +41,7 @@
   "syntax_highlighting": true,
   "syntax_highlighting_mobile": false,
   "enabled_templates_hotkeys": [
-    "00_System/Templates/IP Idea.md",
-    "00_System/Templates/Script.md",
-    "00_System/Templates/Character.md",
-    "00_System/Templates/Publish Record.md"
+    "00｜MAX IP项目总控台/05｜Obsidian-Codex桥接/Templates/Codex｜处理当前笔记.md"
   ],
   "startup_templates": [
     ""
