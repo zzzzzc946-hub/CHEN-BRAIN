@@ -6,12 +6,12 @@
   <string>com.chen.content-link-collector.webhook</string>
 
   <key>WorkingDirectory</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器</string>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器/content_link_collector.py</string>
+    <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/content_link_collector.py</string>
     <string>webhook-server</string>
     <string>--host</string>
     <string>127.0.0.1</string>
@@ -37,9 +37,9 @@
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器/logs/webhook.out.log</string>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/logs/webhook.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器/logs/webhook.err.log</string>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/logs/webhook.err.log</string>
 </dict>
 </plist>
