@@ -4,12 +4,22 @@
   "title": "你现在通读一下我的整个库，是否有冲突或者不和谐的地方，所有内容是否独立且和其他内容协同，我不需要没多...",
   "titleGenerationStatus": "failed",
   "createdAt": 1781432330354,
-  "updatedAt": 1781432347149,
-  "lastResponseAt": 1781432347149,
+  "updatedAt": 1781447557448,
+  "lastResponseAt": 1781447557448,
   "sessionId": "019ec5a4-3239-74c1-9682-c1432d49b069",
   "providerState": {
     "threadId": "019ec5a4-3239-74c1-9682-c1432d49b069",
     "sessionFilePath": "/Users/chen.zip/.codex/sessions/2026/06/14/rollout-2026-06-14T18-18-52-019ec5a4-3239-74c1-9682-c1432d49b069.jsonl",
     "transcriptRootPath": "/Users/chen.zip/.codex/sessions"
+  },
+  "usage": {
+    "inputTokens": 58124,
+    "cacheCreationInputTokens": 0,
+    "cacheReadInputTokens": 54656,
+    "contextWindow": 258400,
+    "contextWindowIsAuthoritative": true,
+    "contextTokens": 58124,
+    "percentage": 22,
+    "model": "gpt-5.5"
   }
 }
