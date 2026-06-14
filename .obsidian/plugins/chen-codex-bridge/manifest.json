@@ -1,0 +1,10 @@
+{
+  "id": "chen-codex-bridge",
+  "name": "CHEN Codex Bridge",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "在 Obsidian 左侧栏直接调用 Codex 处理当前笔记。",
+  "author": "CHEN BRAIN",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

@@ -1,0 +1,17 @@
+.chen-codex-modal textarea.chen-codex-textarea {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+}
+
+.chen-codex-current-file {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.chen-codex-button-row {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
