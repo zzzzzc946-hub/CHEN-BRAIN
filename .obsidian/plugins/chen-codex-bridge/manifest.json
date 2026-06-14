@@ -1,9 +1,9 @@
 {
   "id": "chen-codex-bridge",
   "name": "CHEN Codex Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.0",
-  "description": "在 Obsidian 左侧栏直接调用 Codex 处理当前笔记。",
+  "description": "在 Obsidian 内打开 CHEN AI 对话面板，直接调用 Codex 交流和处理仓库内容。",
   "author": "CHEN BRAIN",
   "authorUrl": "",
   "isDesktopOnly": true

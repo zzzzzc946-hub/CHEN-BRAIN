@@ -1,17 +1,108 @@
-.chen-codex-modal textarea.chen-codex-textarea {
-  width: 100%;
-  min-height: 160px;
-  resize: vertical;
+.chen-ai-chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 14px;
+  gap: 12px;
 }
 
-.chen-codex-current-file {
+.chen-ai-chat-header {
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 10px;
+}
+
+.chen-ai-chat-header h2 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.chen-ai-chat-subtitle {
   color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.chen-ai-chat-messages {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.chen-ai-chat-empty {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex: 1;
+  font-size: var(--font-ui-small);
+  justify-content: center;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.chen-ai-chat-message {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.chen-ai-chat-message-user {
+  background: var(--background-secondary);
+}
+
+.chen-ai-chat-message-assistant {
+  background: var(--background-primary);
+}
+
+.chen-ai-chat-role {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.chen-ai-chat-body pre {
+  background: transparent;
+  font-family: var(--font-text);
+  font-size: var(--font-ui-small);
+  line-height: 1.6;
+  margin: 0;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chen-ai-chat-controls {
+  align-items: center;
+  border-top: 1px solid var(--background-modifier-border);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding-top: 10px;
+}
+
+.chen-ai-chat-check {
+  align-items: center;
+  display: flex;
+  gap: 6px;
   font-size: var(--font-ui-small);
 }
 
-.chen-codex-button-row {
+.chen-ai-chat-input-row {
   display: flex;
   gap: 8px;
-  justify-content: flex-end;
-  margin-top: 12px;
+}
+
+.chen-ai-chat-input {
+  min-height: 86px;
+  resize: vertical;
+  width: 100%;
+}
+
+.chen-ai-chat-send {
+  min-width: 76px;
 }
