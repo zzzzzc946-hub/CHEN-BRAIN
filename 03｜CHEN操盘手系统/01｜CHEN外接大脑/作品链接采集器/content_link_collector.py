@@ -57,6 +57,8 @@ DEFAULT_FIELDS = {
     "error": "错误信息",
 }
 
+RETRY_TRANSCRIPT_STATUSES = {"待转写", "转写中"}
+
 FIELD_SPECS = [
     ("作品链接", 1, None),
     ("平台", 1, None),
@@ -76,10 +78,16 @@ FIELD_SPECS = [
 
 HOLD_STATUSES = {
     "成功",
+    "需登录",
     "需Cookie",
+    "图文作品",
+    "无音频",
+    "下载失败",
+    "转写失败",
+    "平台限制",
+    "待人工确认",
     "需ASR",
     "ASR失败",
-    "下载失败",
     "待人工处理",
     "待Downie人工下载",
 }
@@ -1081,15 +1089,21 @@ def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Opt
 def classify_processing_error(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
-    if "cookie" in lowered or "登录" in text or "fresh cookies" in lowered:
+    if "刷新登录态" in text or "登录态" in text or "重新登录" in text or "login required" in lowered:
+        return "需登录"
+    if "cookie" in lowered or "cookies" in lowered or "需要登录 cookie" in lowered or "fresh cookies" in lowered:
         return "需Cookie"
-    if "未拿到视频/音频直链" in text:
-        return "需ASR"
+    if "图文" in text or "图片作品" in text or "image note" in lowered:
+        return "图文作品"
+    if "无音频" in text or "没有音频" in text or "音频流为空" in text or "no audio" in lowered:
+        return "无音频"
+    if "未拿到视频/音频直链" in text or "页面没有暴露标题" in text or "风控" in text or "captcha" in lowered:
+        return "平台限制"
     if "下载" in text or "download" in lowered or "ffmpeg" in lowered or "抽取音频失败" in text:
         return "下载失败"
     if "asr" in lowered or "whisper" in lowered or "转写" in text or "transcrib" in lowered or "openai" in lowered:
-        return "ASR失败"
-    return "待人工处理"
+        return "转写失败"
+    return "待人工确认"
 
 
 def challenge_response(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -1144,7 +1158,9 @@ def should_process_blank_record(record: Dict[str, Any], cfg: Dict[str, Any]) -> 
     title = as_text(fields.get(names["title"]))
     caption = as_text(fields.get(names["caption"]))
     status = as_text(fields.get(names["status"]))
-    return not title and not caption and not status
+    if not title and not caption and not status:
+        return True
+    return bool(title and not caption and status in RETRY_TRANSCRIPT_STATUSES)
 
 
 def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dict[str, int], transcribe: bool = True) -> str:
@@ -1160,15 +1176,21 @@ def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dic
 
     meta = extract_from_page(url, cfg)
     update_fields = build_update_fields(cfg, meta, field_types)
+    needs_asr = bool(not meta.get("caption") and not str(meta.get("duration") or "").endswith("图"))
     if not meta.get("title"):
-        update_fields.update(status_fields(cfg, "部分成功", "已访问链接，但页面没有暴露标题；可能需要登录 cookie 或官方接口。", field_types))
+        update_fields.update(status_fields(cfg, "平台限制", "已访问链接，但页面没有暴露标题；可能需要登录 Cookie、刷新登录态或官方接口。", field_types))
     elif not meta.get("caption"):
-        update_fields.update(status_fields(cfg, "部分成功", "已抓到作品信息，但未抓到视频逐字稿；需要字幕/ASR能力。", field_types))
+        if str(meta.get("duration") or "").endswith("图"):
+            update_fields.update(status_fields(cfg, "图文作品", "已抓到作品信息；这是图文作品，没有视频逐字稿。", field_types))
+        else:
+            status = "转写中" if transcribe else "待转写"
+            message = "已抓到作品信息和封面；页面没有自带字幕，等待视频音频 ASR 转写。"
+            update_fields.update(status_fields(cfg, status, message, field_types))
     if update_fields:
         update_record(cfg, record_id, update_fields)
 
     existing_caption = as_text(fields.get(names["caption"]))
-    if transcribe and not existing_caption and not meta.get("caption"):
+    if transcribe and not existing_caption and needs_asr:
         try:
             text = transcribe_from_meta(cfg, meta)
         except Exception as e:
@@ -1181,6 +1203,8 @@ def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dic
             names["error"]: "",
         }, field_types))
         return "transcribed"
+    if needs_asr and not transcribe:
+        return "metadata_synced"
     return "synced"
 
 
@@ -1267,9 +1291,12 @@ def cmd_sync(args: argparse.Namespace) -> None:
             meta = extract_from_page(url, cfg)
             update_fields = build_update_fields(cfg, meta, field_types)
             if not meta.get("title"):
-                update_fields.update(status_fields(cfg, "部分成功", "已访问链接，但页面没有暴露标题；可能需要登录 cookie 或官方接口。", field_types))
+                update_fields.update(status_fields(cfg, "平台限制", "已访问链接，但页面没有暴露标题；可能需要登录 Cookie、刷新登录态或官方接口。", field_types))
             elif not meta.get("caption"):
-                update_fields.update(status_fields(cfg, "部分成功", "已抓到作品信息，但未抓到视频逐字稿；需要字幕/ASR能力。", field_types))
+                if str(meta.get("duration") or "").endswith("图"):
+                    update_fields.update(status_fields(cfg, "图文作品", "已抓到作品信息；这是图文作品，没有视频逐字稿。", field_types))
+                else:
+                    update_fields.update(status_fields(cfg, "待转写", "已抓到作品信息和封面；页面没有自带字幕，等待视频音频 ASR 转写。", field_types))
             if update_fields:
                 update_record(cfg, record_id, update_fields)
             done += 1
@@ -1302,7 +1329,7 @@ def cmd_clean_fake_transcripts(args: argparse.Namespace) -> None:
         if title and caption and title == caption:
             update = keep_existing_fields({
                 names["caption"]: "",
-                names["status"]: "部分成功",
+                names["status"]: "待转写",
                 names["fetched_at"]: now_text(),
                 names["error"]: "已清空错误文案：原内容只是作品标题/描述，不是视频逐字稿。",
             }, field_types)
@@ -1420,7 +1447,7 @@ def webhook_worker(
             print(f"{log_prefix}失败：{record_id} -> {e}", flush=True)
             try:
                 field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
-                update_record(cfg, record_id, status_fields(cfg, "失败", str(e), field_types))
+                update_record(cfg, record_id, status_fields(cfg, classify_processing_error(e), str(e), field_types))
             except Exception:
                 pass
         finally:

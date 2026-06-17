@@ -77,6 +77,35 @@ class WebhookHelperTests(unittest.TestCase):
             collector.should_process_blank_record({"fields": {"作品标题": "已有标题"}}, cfg)
         )
 
+    def test_should_process_retry_transcript_rows(self):
+        collector = load_collector()
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "作品标题": "已有标题",
+                        "抓取状态": "待转写",
+                    }
+                },
+                cfg,
+            )
+        )
+        self.assertFalse(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "作品标题": "已有标题",
+                        "抓取状态": "无音频",
+                    }
+                },
+                cfg,
+            )
+        )
+
     def test_first_url_prefers_full_url_list_before_douyin_uri(self):
         collector = load_collector()
 
