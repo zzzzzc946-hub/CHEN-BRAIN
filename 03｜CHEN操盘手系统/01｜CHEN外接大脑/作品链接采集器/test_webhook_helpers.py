@@ -57,6 +57,46 @@ class WebhookHelperTests(unittest.TestCase):
             ["recSdkRecord123", "recSdkRecord456"],
         )
 
+    def test_extract_bitable_action_jobs_keeps_table_id(self):
+        collector = load_collector()
+
+        class Action:
+            def __init__(self, record_id, table_id=""):
+                self.record_id = record_id
+                self.table_id = table_id
+
+        class EventData:
+            table_id = "tblDefault"
+            action_list = [Action("recSdkRecord123", "tblA"), Action("recSdkRecord456")]
+
+        class SdkEvent:
+            event = EventData()
+
+        self.assertEqual(
+            collector.extract_bitable_action_jobs(SdkEvent()),
+            [("tblA", "recSdkRecord123"), ("tblDefault", "recSdkRecord456")],
+        )
+
+    def test_feishu_table_ids_dedupes_primary_and_extra_tables(self):
+        collector = load_collector()
+        cfg = {
+            "feishu": {
+                "table_id": "tblPrimary",
+                "table_ids": ["tblPrimary", "tblCopy", "", "tblCopy"],
+            }
+        }
+
+        self.assertEqual(collector.feishu_table_ids(cfg), ["tblPrimary", "tblCopy"])
+
+    def test_with_table_id_overrides_table_without_mutating_source(self):
+        collector = load_collector()
+        cfg = {"feishu": {"table_id": "tblPrimary", "app_token": "app"}, "fields": collector.DEFAULT_FIELDS}
+
+        table_cfg = collector.with_table_id(cfg, "tblCopy")
+
+        self.assertEqual(table_cfg["feishu"]["table_id"], "tblCopy")
+        self.assertEqual(cfg["feishu"]["table_id"], "tblPrimary")
+
     def test_should_process_blank_record_only_for_new_link_rows(self):
         collector = load_collector()
         cfg = {"fields": collector.DEFAULT_FIELDS}
@@ -146,6 +186,7 @@ class WebhookHelperTests(unittest.TestCase):
             }
         }
 
+        collector.tenant_access_token = lambda cfg: "tenant_token"
         self.assertEqual(collector.attachment_parent_node(cfg), "real_bitable_token")
         self.assertIn("/open-apis/wiki/v2/spaces/get_node?token=wiki_node_token", calls[0][1])
 

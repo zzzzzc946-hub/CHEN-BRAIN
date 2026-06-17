@@ -180,6 +180,23 @@ def require_feishu(cfg: Dict[str, Any]) -> Dict[str, str]:
     return feishu
 
 
+def feishu_table_ids(cfg: Dict[str, Any]) -> List[str]:
+    feishu = cfg.get("feishu") or {}
+    raw_ids = [feishu.get("table_id"), *(feishu.get("table_ids") or [])]
+    table_ids: List[str] = []
+    for raw in raw_ids:
+        table_id = str(raw or "").strip()
+        if table_id and table_id not in table_ids:
+            table_ids.append(table_id)
+    return table_ids
+
+
+def with_table_id(cfg: Dict[str, Any], table_id: str) -> Dict[str, Any]:
+    table_cfg = dict(cfg)
+    table_cfg["feishu"] = {**(cfg.get("feishu") or {}), "table_id": table_id}
+    return table_cfg
+
+
 def now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1149,6 +1166,20 @@ def extract_bitable_action_record_ids(event: Any) -> List[str]:
     return found
 
 
+def extract_bitable_action_jobs(event: Any) -> List[Tuple[str, str]]:
+    jobs: List[Tuple[str, str]] = []
+    event_data = getattr(event, "event", None)
+    default_table_id = str(getattr(event_data, "table_id", "") or "").strip()
+    action_list = getattr(event_data, "action_list", None) or []
+    for action in action_list:
+        record_id = str(getattr(action, "record_id", "") or "").strip()
+        table_id = str(getattr(action, "table_id", "") or default_table_id).strip()
+        job = (table_id, record_id)
+        if record_id and job not in jobs:
+            jobs.append(job)
+    return jobs
+
+
 def should_process_blank_record(record: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
     fields = record.get("fields") or {}
     names = cfg["fields"]
@@ -1424,7 +1455,7 @@ def cmd_format_transcripts(args: argparse.Namespace) -> None:
 
 def webhook_worker(
     cfg: Dict[str, Any],
-    jobs: "queue.Queue[str]",
+    jobs: "queue.Queue[Tuple[str, str]]",
     stop_event: threading.Event,
     pending: Optional[set[str]] = None,
     pending_lock: Optional[threading.Lock] = None,
@@ -1432,54 +1463,58 @@ def webhook_worker(
 ) -> None:
     while not stop_event.is_set():
         try:
-            record_id = jobs.get(timeout=0.5)
+            table_id, record_id = jobs.get(timeout=0.5)
         except queue.Empty:
             continue
+        job_key = f"{table_id}:{record_id}"
+        table_cfg = with_table_id(cfg, table_id) if table_id else cfg
         try:
-            print(f"{log_prefix}处理：{record_id}", flush=True)
-            field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
-            record = get_record(cfg, record_id)
+            print(f"{log_prefix}处理：table_id={table_id or '-'} record_id={record_id}", flush=True)
+            field_types = {x.get("field_name"): x.get("type") for x in list_fields(table_cfg)}
+            record = get_record(table_cfg, record_id)
             if not record:
                 raise RuntimeError(f"未找到记录：{record_id}")
-            result = process_record(record, cfg, field_types, transcribe=True)
-            print(f"{log_prefix}完成：{record_id} -> {result}", flush=True)
+            result = process_record(record, table_cfg, field_types, transcribe=True)
+            print(f"{log_prefix}完成：table_id={table_id or '-'} record_id={record_id} -> {result}", flush=True)
         except Exception as e:
-            print(f"{log_prefix}失败：{record_id} -> {e}", flush=True)
+            print(f"{log_prefix}失败：table_id={table_id or '-'} record_id={record_id} -> {e}", flush=True)
             try:
-                field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
-                update_record(cfg, record_id, status_fields(cfg, classify_processing_error(e), str(e), field_types))
+                field_types = {x.get("field_name"): x.get("type") for x in list_fields(table_cfg)}
+                update_record(table_cfg, record_id, status_fields(table_cfg, classify_processing_error(e), str(e), field_types))
             except Exception:
                 pass
         finally:
             if pending is not None and pending_lock is not None:
                 with pending_lock:
-                    pending.discard(record_id)
+                    pending.discard(job_key)
             jobs.task_done()
 
 
 def queue_record_ids(
-    jobs: "queue.Queue[str]",
+    jobs: "queue.Queue[Tuple[str, str]]",
     pending: set[str],
     pending_lock: threading.Lock,
     record_ids: Iterable[str],
     source: str,
+    table_id: str = "",
 ) -> List[str]:
     queued: List[str] = []
     with pending_lock:
         for record_id in record_ids:
-            if not record_id or record_id in pending:
+            job_key = f"{table_id}:{record_id}"
+            if not record_id or job_key in pending:
                 continue
-            pending.add(record_id)
-            jobs.put(record_id)
+            pending.add(job_key)
+            jobs.put((table_id, record_id))
             queued.append(record_id)
     if queued:
-        print(f"{source}入队：record_ids={queued}", flush=True)
+        print(f"{source}入队：table_id={table_id or '-'} record_ids={queued}", flush=True)
     return queued
 
 
 def missed_record_scanner(
     cfg: Dict[str, Any],
-    jobs: "queue.Queue[str]",
+    jobs: "queue.Queue[Tuple[str, str]]",
     stop_event: threading.Event,
     pending: set[str],
     pending_lock: threading.Lock,
@@ -1487,18 +1522,20 @@ def missed_record_scanner(
 ) -> None:
     while not stop_event.wait(max(5, interval)):
         try:
-            records = list_records(cfg)
-            record_ids = [
-                record.get("record_id") or ""
-                for record in records
-                if should_process_blank_record(record, cfg)
-            ]
-            queue_record_ids(jobs, pending, pending_lock, record_ids, "补扫")
+            for table_id in feishu_table_ids(cfg):
+                table_cfg = with_table_id(cfg, table_id)
+                records = list_records(table_cfg)
+                record_ids = [
+                    record.get("record_id") or ""
+                    for record in records
+                    if should_process_blank_record(record, table_cfg)
+                ]
+                queue_record_ids(jobs, pending, pending_lock, record_ids, "补扫", table_id)
         except Exception as e:
             print(f"补扫失败：{e}", flush=True)
 
 
-def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
+def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[Tuple[str, str]]"):
     pending: set[str] = set()
     pending_lock = threading.Lock()
     webhook_cfg = cfg.get("webhook") or {}
@@ -1554,17 +1591,18 @@ def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
             queued: List[str] = []
             with pending_lock:
                 for record_id in record_ids:
-                    if record_id in pending:
+                    job_key = f":{record_id}"
+                    if job_key in pending:
                         continue
-                    pending.add(record_id)
-                    jobs.put(record_id)
+                    pending.add(job_key)
+                    jobs.put(("", record_id))
                     queued.append(record_id)
 
             def clear_pending() -> None:
                 jobs.join()
                 with pending_lock:
                     for record_id in queued:
-                        pending.discard(record_id)
+                        pending.discard(f":{record_id}")
 
             if queued:
                 threading.Thread(target=clear_pending, daemon=True).start()
@@ -1575,7 +1613,7 @@ def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
 
 def cmd_webhook_server(args: argparse.Namespace) -> None:
     cfg = load_config()
-    jobs: "queue.Queue[str]" = queue.Queue()
+    jobs: "queue.Queue[Tuple[str, str]]" = queue.Queue()
     stop_event = threading.Event()
     worker = threading.Thread(target=webhook_worker, args=(cfg, jobs, stop_event), daemon=True)
     worker.start()
@@ -1594,7 +1632,7 @@ def cmd_webhook_server(args: argparse.Namespace) -> None:
 def cmd_event_listener(args: argparse.Namespace) -> None:
     cfg = load_config()
     feishu = require_feishu_credentials(cfg)
-    jobs: "queue.Queue[str]" = queue.Queue()
+    jobs: "queue.Queue[Tuple[str, str]]" = queue.Queue()
     stop_event = threading.Event()
     pending: set[str] = set()
     pending_lock = threading.Lock()
@@ -1623,6 +1661,12 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
     scanner.start()
 
     def on_bitable_record_changed(event: Any) -> None:
+        event_jobs = extract_bitable_action_jobs(event)
+        if event_jobs:
+            print(f"长连接事件：jobs={event_jobs}", flush=True)
+            for table_id, record_id in event_jobs:
+                queue_record_ids(jobs, pending, pending_lock, [record_id], "长连接事件", table_id)
+            return
         record_ids = extract_bitable_action_record_ids(event)
         print(f"长连接事件：record_ids={record_ids}", flush=True)
         queue_record_ids(jobs, pending, pending_lock, record_ids, "长连接事件")

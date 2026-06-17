@@ -4,6 +4,9 @@
     "app_secret": "在这里填AppSecret",
     "app_token": "飞书多维表格URL里 base/ 后面的 token",
     "table_id": "飞书多维表格URL里 table= 后面的 tbl...",
+    "table_ids": [
+      "可选：复制表格后，把每个新表 URL 里的 table=tbl... 加到这里"
+    ],
     "base_url": "https://open.feishu.cn"
   },
   "fields": {
