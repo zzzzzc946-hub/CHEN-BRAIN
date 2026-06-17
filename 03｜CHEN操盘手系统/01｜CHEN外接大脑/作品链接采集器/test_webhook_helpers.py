@@ -144,10 +144,13 @@ class WebhookHelperTests(unittest.TestCase):
         collector = load_collector()
 
         self.assertEqual(collector.classify_processing_error(RuntimeError("yt-dlp 需要登录 Cookie")), "需Cookie")
-        self.assertEqual(collector.classify_processing_error(RuntimeError("未拿到视频/音频直链")), "需ASR")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("抖音要求刷新登录态")), "需登录")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("这是图文作品，没有视频音频")), "图文作品")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("未拿到视频/音频直链")), "平台限制")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("音频流为空 no audio stream")), "无音频")
         self.assertEqual(collector.classify_processing_error(RuntimeError("ffmpeg 抽取音频失败")), "下载失败")
-        self.assertEqual(collector.classify_processing_error(RuntimeError("OpenAI 转写失败 HTTP 500")), "ASR失败")
-        self.assertEqual(collector.classify_processing_error(RuntimeError("其它错误")), "待人工处理")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("OpenAI 转写失败 HTTP 500")), "转写失败")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("其它错误")), "待人工确认")
 
     def test_build_update_fields_does_not_write_empty_caption(self):
         collector = load_collector()
