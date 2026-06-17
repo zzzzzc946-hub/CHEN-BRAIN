@@ -41,7 +41,8 @@
   },
   "event": {
     "encrypt_key": "",
-    "verification_token": ""
+    "verification_token": "",
+    "scan_interval": 15
   },
   "webhook": {
     "verification_token": ""

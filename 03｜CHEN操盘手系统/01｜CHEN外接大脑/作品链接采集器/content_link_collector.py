@@ -74,6 +74,16 @@ FIELD_SPECS = [
     ("错误信息", 1, None),
 ]
 
+HOLD_STATUSES = {
+    "成功",
+    "需Cookie",
+    "需ASR",
+    "ASR失败",
+    "下载失败",
+    "待人工处理",
+    "待Downie人工下载",
+}
+
 TRANSCRIPT_KEYS = [
     "transcript",
     "subtitle",
@@ -142,6 +152,7 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg.setdefault("event", {})
     cfg["event"].setdefault("encrypt_key", "")
     cfg["event"].setdefault("verification_token", cfg["webhook"].get("verification_token", ""))
+    cfg["event"].setdefault("scan_interval", 15)
     return cfg
 
 
@@ -829,7 +840,11 @@ def first_url(value: Any) -> str:
             if got:
                 return got
     if isinstance(value, dict):
-        for key in ("url", "uri", "cover", "coverUrl", "originCover", "dynamicCover", "src"):
+        for key in ("url_list", "urlList", "urls"):
+            got = first_url(value.get(key))
+            if got and got.startswith(("http://", "https://")):
+                return got
+        for key in ("url", "cover", "coverUrl", "originCover", "dynamicCover", "src", "uri"):
             got = first_url(value.get(key))
             if got:
                 return got
@@ -1007,15 +1022,20 @@ def keep_existing_fields(fields: Dict[str, Any], field_types: Dict[str, int]) ->
 def build_update_fields(cfg: Dict[str, Any], meta: Dict[str, Any], field_types: Dict[str, int]) -> Dict[str, Any]:
     names = cfg["fields"]
     out: Dict[str, Any] = {
-        names["platform"]: meta.get("platform") or "",
-        names["title"]: meta.get("title") or "",
-        names["caption"]: meta.get("caption") or "",
-        names["duration"]: meta.get("duration") or "",
-        names["published_at"]: meta.get("published_at") or "",
         names["status"]: "成功",
         names["fetched_at"]: now_text(),
         names["error"]: "",
     }
+    for key, field_name in (
+        ("platform", names["platform"]),
+        ("title", names["title"]),
+        ("caption", names["caption"]),
+        ("duration", names["duration"]),
+        ("published_at", names["published_at"]),
+    ):
+        value = meta.get(key)
+        if value not in (None, ""):
+            out[field_name] = value
 
     for key, field_name in (("likes", names["likes"]), ("comments", names["comments"]), ("shares", names["shares"])):
         if meta.get(key) is not None:
@@ -1043,6 +1063,20 @@ def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Opt
         names["error"]: error[:1000],
     }
     return keep_existing_fields(fields, field_types) if field_types is not None else fields
+
+
+def classify_processing_error(error: Exception) -> str:
+    text = str(error)
+    lowered = text.lower()
+    if "cookie" in lowered or "登录" in text or "fresh cookies" in lowered:
+        return "需Cookie"
+    if "未拿到视频/音频直链" in text:
+        return "需ASR"
+    if "下载" in text or "download" in lowered or "ffmpeg" in lowered or "抽取音频失败" in text:
+        return "下载失败"
+    if "asr" in lowered or "whisper" in lowered or "转写" in text or "transcrib" in lowered or "openai" in lowered:
+        return "ASR失败"
+    return "待人工处理"
 
 
 def challenge_response(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -1088,6 +1122,18 @@ def extract_bitable_action_record_ids(event: Any) -> List[str]:
     return found
 
 
+def should_process_blank_record(record: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    fields = record.get("fields") or {}
+    names = cfg["fields"]
+    url = normalize_url(as_text(fields.get(names["url"])))
+    if not url:
+        return False
+    title = as_text(fields.get(names["title"]))
+    caption = as_text(fields.get(names["caption"]))
+    status = as_text(fields.get(names["status"]))
+    return not title and not caption and not status
+
+
 def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dict[str, int], transcribe: bool = True) -> str:
     names = cfg["fields"]
     record_id = record.get("record_id") or record.get("id") or ""
@@ -1110,7 +1156,11 @@ def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dic
 
     existing_caption = as_text(fields.get(names["caption"]))
     if transcribe and not existing_caption and not meta.get("caption"):
-        text = transcribe_from_meta(cfg, meta)
+        try:
+            text = transcribe_from_meta(cfg, meta)
+        except Exception as e:
+            update_record(cfg, record_id, status_fields(cfg, classify_processing_error(e), str(e), field_types))
+            return "failed"
         update_record(cfg, record_id, keep_existing_fields({
             names["caption"]: text,
             names["status"]: "成功",
@@ -1175,6 +1225,8 @@ def should_process(record: Dict[str, Any], cfg: Dict[str, Any], all_rows: bool) 
     status = as_text(fields.get(names["status"]))
     if title and status == "成功":
         return False, url
+    if status in HOLD_STATUSES:
+        return False, url
     error = as_text(fields.get(names["error"]))
     if "Cookie" in error and not has_ytdlp_cookie(cfg):
         return False, url
@@ -1211,7 +1263,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         except Exception as e:
             failed += 1
             try:
-                fields = status_fields(cfg, "失败", str(e), field_types)
+                fields = status_fields(cfg, classify_processing_error(e), str(e), field_types)
                 if fields:
                     update_record(cfg, record_id, fields)
             except Exception:
@@ -1330,29 +1382,80 @@ def cmd_format_transcripts(args: argparse.Namespace) -> None:
     print(f"完成：格式化 {done} 条，跳过 {skipped} 条", flush=True)
 
 
-def webhook_worker(cfg: Dict[str, Any], jobs: "queue.Queue[str]", stop_event: threading.Event) -> None:
+def webhook_worker(
+    cfg: Dict[str, Any],
+    jobs: "queue.Queue[str]",
+    stop_event: threading.Event,
+    pending: Optional[set[str]] = None,
+    pending_lock: Optional[threading.Lock] = None,
+    log_prefix: str = "Webhook",
+) -> None:
     while not stop_event.is_set():
         try:
             record_id = jobs.get(timeout=0.5)
         except queue.Empty:
             continue
         try:
-            print(f"Webhook处理：{record_id}", flush=True)
+            print(f"{log_prefix}处理：{record_id}", flush=True)
             field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
             record = get_record(cfg, record_id)
             if not record:
                 raise RuntimeError(f"未找到记录：{record_id}")
             result = process_record(record, cfg, field_types, transcribe=True)
-            print(f"Webhook完成：{record_id} -> {result}", flush=True)
+            print(f"{log_prefix}完成：{record_id} -> {result}", flush=True)
         except Exception as e:
-            print(f"Webhook失败：{record_id} -> {e}", flush=True)
+            print(f"{log_prefix}失败：{record_id} -> {e}", flush=True)
             try:
                 field_types = {x.get("field_name"): x.get("type") for x in list_fields(cfg)}
                 update_record(cfg, record_id, status_fields(cfg, "失败", str(e), field_types))
             except Exception:
                 pass
         finally:
+            if pending is not None and pending_lock is not None:
+                with pending_lock:
+                    pending.discard(record_id)
             jobs.task_done()
+
+
+def queue_record_ids(
+    jobs: "queue.Queue[str]",
+    pending: set[str],
+    pending_lock: threading.Lock,
+    record_ids: Iterable[str],
+    source: str,
+) -> List[str]:
+    queued: List[str] = []
+    with pending_lock:
+        for record_id in record_ids:
+            if not record_id or record_id in pending:
+                continue
+            pending.add(record_id)
+            jobs.put(record_id)
+            queued.append(record_id)
+    if queued:
+        print(f"{source}入队：record_ids={queued}", flush=True)
+    return queued
+
+
+def missed_record_scanner(
+    cfg: Dict[str, Any],
+    jobs: "queue.Queue[str]",
+    stop_event: threading.Event,
+    pending: set[str],
+    pending_lock: threading.Lock,
+    interval: int,
+) -> None:
+    while not stop_event.wait(max(5, interval)):
+        try:
+            records = list_records(cfg)
+            record_ids = [
+                record.get("record_id") or ""
+                for record in records
+                if should_process_blank_record(record, cfg)
+            ]
+            queue_record_ids(jobs, pending, pending_lock, record_ids, "补扫")
+        except Exception as e:
+            print(f"补扫失败：{e}", flush=True)
 
 
 def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[str]"):
@@ -1453,7 +1556,13 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
     feishu = require_feishu_credentials(cfg)
     jobs: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
-    worker = threading.Thread(target=webhook_worker, args=(cfg, jobs, stop_event), daemon=True)
+    pending: set[str] = set()
+    pending_lock = threading.Lock()
+    worker = threading.Thread(
+        target=webhook_worker,
+        args=(cfg, jobs, stop_event, pending, pending_lock, "长连接"),
+        daemon=True,
+    )
     worker.start()
 
     try:
@@ -1465,12 +1574,18 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
     event_cfg = cfg.get("event") or {}
     encrypt_key = event_cfg.get("encrypt_key") or ""
     verification_token = event_cfg.get("verification_token") or ""
+    scan_interval = int(event_cfg.get("scan_interval") or 15)
+    scanner = threading.Thread(
+        target=missed_record_scanner,
+        args=(cfg, jobs, stop_event, pending, pending_lock, scan_interval),
+        daemon=True,
+    )
+    scanner.start()
 
     def on_bitable_record_changed(event: Any) -> None:
         record_ids = extract_bitable_action_record_ids(event)
         print(f"长连接事件：record_ids={record_ids}", flush=True)
-        for record_id in record_ids:
-            jobs.put(record_id)
+        queue_record_ids(jobs, pending, pending_lock, record_ids, "长连接事件")
 
     event_handler = (
         lark.EventDispatcherHandler.builder(encrypt_key, verification_token)
@@ -1527,6 +1642,7 @@ def cmd_make_config(_: argparse.Namespace) -> None:
         "event": {
             "encrypt_key": "",
             "verification_token": "",
+            "scan_interval": 15,
         },
     }
     CONFIG_PATH.write_text(json.dumps(example, ensure_ascii=False, indent=2), encoding="utf-8")
