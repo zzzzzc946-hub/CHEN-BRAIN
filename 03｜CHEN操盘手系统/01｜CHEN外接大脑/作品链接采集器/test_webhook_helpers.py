@@ -88,6 +88,23 @@ class WebhookHelperTests(unittest.TestCase):
 
         self.assertEqual(collector.feishu_table_ids(cfg), ["tblPrimary", "tblCopy"])
 
+    def test_discover_feishu_table_ids_merges_auto_discovered_tables(self):
+        collector = load_collector()
+        cfg = {
+            "feishu": {
+                "app_id": "cli_x",
+                "app_secret": "secret",
+                "app_token": "app",
+                "table_id": "tblPrimary",
+                "table_ids": ["tblCopy"],
+                "auto_discover_tables": True,
+            }
+        }
+
+        collector.list_tables = lambda cfg: [{"table_id": "tblPrimary"}, {"table_id": "tblNew"}]
+
+        self.assertEqual(collector.discover_feishu_table_ids(cfg), ["tblPrimary", "tblCopy", "tblNew"])
+
     def test_with_table_id_overrides_table_without_mutating_source(self):
         collector = load_collector()
         cfg = {"feishu": {"table_id": "tblPrimary", "app_token": "app"}, "fields": collector.DEFAULT_FIELDS}
@@ -96,6 +113,13 @@ class WebhookHelperTests(unittest.TestCase):
 
         self.assertEqual(table_cfg["feishu"]["table_id"], "tblCopy")
         self.assertEqual(cfg["feishu"]["table_id"], "tblPrimary")
+
+    def test_event_worker_count_defaults_and_clamps(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.event_worker_count({}), 3)
+        self.assertEqual(collector.event_worker_count({"event": {"worker_count": 0}}), 1)
+        self.assertEqual(collector.event_worker_count({"event": {"worker_count": 99}}), 8)
 
     def test_should_process_blank_record_only_for_new_link_rows(self):
         collector = load_collector()
@@ -133,6 +157,18 @@ class WebhookHelperTests(unittest.TestCase):
                 cfg,
             )
         )
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "作品标题": "已有标题",
+                        "抓取状态": "网络异常",
+                    }
+                },
+                cfg,
+            )
+        )
         self.assertFalse(
             collector.should_process_blank_record(
                 {
@@ -140,6 +176,39 @@ class WebhookHelperTests(unittest.TestCase):
                         "作品链接": "https://www.douyin.com/video/123456789",
                         "作品标题": "已有标题",
                         "抓取状态": "无音频",
+                    }
+                },
+                cfg,
+            )
+        )
+
+    def test_classify_transient_tls_error_as_retryable(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.classify_processing_error(
+                RuntimeError("<urlopen error EOF occurred in violation of protocol (_ssl.c:1129)>")
+            ),
+            "网络异常",
+        )
+
+    def test_should_transcribe_record_only_after_metadata_sync(self):
+        collector = load_collector()
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+
+        self.assertFalse(
+            collector.should_transcribe_record(
+                {"fields": {"作品链接": "https://www.douyin.com/video/123456789"}},
+                cfg,
+            )
+        )
+        self.assertTrue(
+            collector.should_transcribe_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "作品标题": "已有标题",
+                        "抓取状态": "待转写",
                     }
                 },
                 cfg,
@@ -158,6 +227,77 @@ class WebhookHelperTests(unittest.TestCase):
             ),
             "https://p3-sign.douyinpic.com/full-cover.webp",
         )
+
+    def test_iter_json_objects_reads_xiaohongshu_initial_state(self):
+        collector = load_collector()
+        html = '<script>window.__INITIAL_STATE__={"note":{"title":"小红书标题"}};</script>'
+
+        objects = list(collector.iter_json_objects(html))
+
+        self.assertEqual(objects[-1]["note"]["title"], "小红书标题")
+
+    def test_extract_xiaohongshu_image_note_writes_body_as_caption(self):
+        collector = load_collector()
+        html = """
+        <html><script>window.__INITIAL_STATE__={
+          "noteDetailMap": {
+            "abc": {"note": {
+              "type": "normal",
+              "title": "穿搭图文笔记",
+              "desc": "这是图文正文",
+              "imageList": [{"urlDefault": "https://ci.xiaohongshu.com/cover.jpg"}],
+              "interactInfo": {"likedCount": "1.2万", "commentCount": "345", "shareCount": "67", "collectedCount": "890"},
+              "time": 1710000000000
+            }}
+          }
+        };</script></html>
+        """
+
+        meta = collector.extract_xiaohongshu_meta("https://www.xiaohongshu.com/explore/abc", html, "https://www.xiaohongshu.com/explore/abc")
+
+        self.assertEqual(meta["platform"], "小红书")
+        self.assertEqual(meta["title"], "穿搭图文笔记")
+        self.assertEqual(meta["caption"], "这是图文正文")
+        self.assertEqual(meta["cover_url"], "https://ci.xiaohongshu.com/cover.jpg")
+        self.assertEqual(meta["duration"], "图文")
+        self.assertEqual(meta["likes"], 12000)
+        self.assertEqual(meta["comments"], 345)
+        self.assertEqual(meta["shares"], 67)
+
+    def test_extract_xiaohongshu_cover_normalizes_protocol_relative_url(self):
+        collector = load_collector()
+        html = """
+        <meta property="og:image" content="//ci.xiaohongshu.com/cover.jpg">
+        <script>window.__INITIAL_STATE__={"note":{"title":"标题","desc":"正文","type":"normal"}};</script>
+        """
+
+        meta = collector.extract_xiaohongshu_meta("https://www.xiaohongshu.com/explore/abc", html, "https://www.xiaohongshu.com/explore/abc")
+
+        self.assertEqual(meta["cover_url"], "https://ci.xiaohongshu.com/cover.jpg")
+
+    def test_extract_xiaohongshu_video_note_keeps_caption_for_asr(self):
+        collector = load_collector()
+        html = """
+        <html><script>window.__INITIAL_STATE__={
+          "note": {
+            "type": "video",
+            "title": "视频笔记",
+            "desc": "这是视频简介，不是逐字稿",
+            "cover": {"url": "https://ci.xiaohongshu.com/video-cover.jpg"},
+            "interactInfo": {"likedCount": 12, "commentCount": 3, "collectedCount": 4},
+            "video": {"media": {"stream": {"h264": [{"masterUrl": "https://sns-video-hw.xhscdn.com/video.mp4"}]}}, "duration": 83000}
+          }
+        };</script></html>
+        """
+
+        meta = collector.extract_xiaohongshu_meta("https://www.xiaohongshu.com/explore/abc", html, "https://www.xiaohongshu.com/explore/abc")
+
+        self.assertEqual(meta["title"], "视频笔记")
+        self.assertEqual(meta["caption"], "")
+        self.assertEqual(meta["cover_url"], "https://ci.xiaohongshu.com/video-cover.jpg")
+        self.assertEqual(meta["duration"], "01:23")
+        self.assertEqual(meta["media_url"], "https://sns-video-hw.xhscdn.com/video.mp4")
+        self.assertEqual(meta["shares"], 4)
 
     def test_attachment_parent_node_uses_wiki_obj_token_when_available(self):
         collector = load_collector()

@@ -7,6 +7,7 @@
     "table_ids": [
       "可选：复制表格后，把每个新表 URL 里的 table_id 加到这里"
     ],
+    "auto_discover_tables": true,
     "base_url": "https://open.feishu.cn"
   },
   "fields": {

@@ -57,7 +57,7 @@ DEFAULT_FIELDS = {
     "error": "错误信息",
 }
 
-RETRY_TRANSCRIPT_STATUSES = {"待转写", "转写中"}
+RETRY_TRANSCRIPT_STATUSES = {"待转写", "转写中", "网络异常"}
 
 FIELD_SPECS = [
     ("作品链接", 1, None),
@@ -191,10 +191,39 @@ def feishu_table_ids(cfg: Dict[str, Any]) -> List[str]:
     return table_ids
 
 
+def append_unique_table_id(table_ids: List[str], raw: Any) -> None:
+    table_id = str(raw or "").strip()
+    if table_id and table_id not in table_ids:
+        table_ids.append(table_id)
+
+
+def discover_feishu_table_ids(cfg: Dict[str, Any]) -> List[str]:
+    table_ids = feishu_table_ids(cfg)
+    feishu = cfg.get("feishu") or {}
+    if not feishu.get("auto_discover_tables", False):
+        return table_ids
+    try:
+        for table in list_tables(cfg):
+            append_unique_table_id(table_ids, table.get("table_id") or table.get("id"))
+    except Exception as e:
+        print(f"自动发现数据表失败：{e}", flush=True)
+    return table_ids
+
+
 def with_table_id(cfg: Dict[str, Any], table_id: str) -> Dict[str, Any]:
     table_cfg = dict(cfg)
     table_cfg["feishu"] = {**(cfg.get("feishu") or {}), "table_id": table_id}
     return table_cfg
+
+
+def event_worker_count(cfg: Dict[str, Any]) -> int:
+    event_cfg = cfg.get("event") or {}
+    try:
+        raw = event_cfg.get("worker_count", 3)
+        count = int(raw if raw is not None else 3)
+    except (TypeError, ValueError):
+        count = 3
+    return max(1, min(8, count))
 
 
 def now_text() -> str:
@@ -290,6 +319,17 @@ def fields_endpoint(cfg: Dict[str, Any]) -> str:
     return f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
 
 
+def tables_endpoint(cfg: Dict[str, Any]) -> str:
+    feishu = require_feishu(cfg)
+    app_token = urllib.parse.quote(feishu["app_token"])
+    return f"/open-apis/bitable/v1/apps/{app_token}/tables"
+
+
+def list_tables(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = feishu_api(cfg, "GET", tables_endpoint(cfg))
+    return (payload.get("data") or {}).get("items") or []
+
+
 def list_fields(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     payload = feishu_api(cfg, "GET", fields_endpoint(cfg))
     return (payload.get("data") or {}).get("items") or []
@@ -348,6 +388,17 @@ def normalize_url(raw: str) -> str:
     raw = raw.strip()
     m = re.search(r"https?://[^\s)）>]+", raw)
     return m.group(0) if m else raw
+
+
+def normalize_resource_url(url: str, base: str = "") -> str:
+    url = (url or "").strip()
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith(("http://", "https://")):
+        return url
+    if url and base:
+        return urllib.parse.urljoin(base, url)
+    return url
 
 
 def detect_platform(url: str) -> str:
@@ -769,6 +820,17 @@ def iter_json_objects(text: str) -> Iterable[Any]:
         except Exception:
             pass
 
+    for marker in ("window.__INITIAL_STATE__=", "window.__INITIAL_STATE__ =", "__INITIAL_STATE__="):
+        index = text.find(marker)
+        if index < 0:
+            continue
+        raw = html.unescape(text[index + len(marker):]).lstrip()
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(raw)
+            yield obj
+        except Exception:
+            continue
+
     next_data = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', text, flags=re.I | re.S)
     if next_data:
         try:
@@ -865,11 +927,27 @@ def first_url(value: Any) -> str:
             if got:
                 return got
     if isinstance(value, dict):
-        for key in ("url_list", "urlList", "urls"):
+        for key in ("url_list", "urlList", "urls", "backupUrls", "backup_urls"):
             got = first_url(value.get(key))
             if got and got.startswith(("http://", "https://")):
                 return got
-        for key in ("url", "cover", "coverUrl", "originCover", "dynamicCover", "src", "uri"):
+        for key in (
+            "url",
+            "urlDefault",
+            "urlPre",
+            "url_pre",
+            "cover",
+            "coverUrl",
+            "originCover",
+            "dynamicCover",
+            "thumbnail",
+            "thumbnailUrl",
+            "src",
+            "uri",
+            "masterUrl",
+            "mainUrl",
+            "videoUrl",
+        ):
             got = first_url(value.get(key))
             if got:
                 return got
@@ -882,8 +960,98 @@ def clean_title(raw: str) -> str:
     return raw
 
 
+def xhs_note_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        note = obj.get("note")
+        if isinstance(note, dict):
+            yield note
+        note_map = obj.get("noteDetailMap") or obj.get("note_detail_map")
+        if isinstance(note_map, dict):
+            for item in note_map.values():
+                if isinstance(item, dict):
+                    nested = item.get("note") or item.get("noteDetail") or item.get("detail")
+                    if isinstance(nested, dict):
+                        yield nested
+                    elif any(k in item for k in ("title", "desc", "interactInfo", "video", "imageList")):
+                        yield item
+        for value in obj.values():
+            yield from xhs_note_candidates(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from xhs_note_candidates(item)
+
+
+def xhs_video_url(note: Dict[str, Any]) -> str:
+    video = note.get("video") or note.get("videoInfo") or note.get("video_info") or {}
+    for _, value in walk_json(video):
+        if isinstance(value, str) and value.startswith(("http://", "https://")) and re.search(r"\.(mp4|m3u8)(?:\?|$)", value):
+            return value
+    return ""
+
+
+def xhs_cover_url(note: Dict[str, Any]) -> str:
+    for key in ("cover", "coverUrl", "imageList", "image_list", "images", "image"):
+        got = first_url(note.get(key))
+        if got:
+            return got
+    return ""
+
+
+def extract_xiaohongshu_meta(url: str, text: str, final_url: str) -> Dict[str, Any]:
+    best_note: Dict[str, Any] = {}
+    for obj in iter_json_objects(text):
+        for note in xhs_note_candidates(obj):
+            if note.get("title") or note.get("desc") or note.get("interactInfo") or note.get("video") or note.get("imageList"):
+                best_note = note
+                break
+        if best_note:
+            break
+
+    metas = {
+        "title": meta_content(text, "og:title", "twitter:title", "title") or title_tag(text),
+        "description": meta_content(text, "description", "og:description", "twitter:description"),
+        "cover_url": meta_content(text, "og:image", "twitter:image"),
+    }
+
+    interact = best_note.get("interactInfo") or best_note.get("interact_info") or {}
+    title = clean_title(str(best_note.get("title") or best_note.get("displayTitle") or metas["title"] or ""))
+    desc = str(best_note.get("desc") or best_note.get("description") or metas["description"] or "").strip()
+    media_url = xhs_video_url(best_note)
+    is_video = bool(media_url or str(best_note.get("type") or "").lower() == "video" or best_note.get("video"))
+    cover_url = xhs_cover_url(best_note) or metas["cover_url"]
+    duration = pick_first_json(best_note, ["duration", "videoDuration", "video_duration"])
+
+    share_count = (
+        interact.get("shareCount")
+        or interact.get("share_count")
+        or best_note.get("shareCount")
+        or best_note.get("share_count")
+        or interact.get("collectedCount")
+        or interact.get("collectCount")
+        or interact.get("collected_count")
+    )
+
+    return {
+        "source_url": url,
+        "final_url": final_url,
+        "platform": "小红书",
+        "title": title or desc[:80],
+        "caption": "" if is_video else desc,
+        "cover_url": normalize_resource_url(cover_url, final_url),
+        "duration": to_duration(duration) if is_video else "图文",
+        "likes": to_int(interact.get("likedCount") or interact.get("likeCount") or interact.get("liked_count") or best_note.get("likedCount")),
+        "comments": to_int(interact.get("commentCount") or interact.get("comment_count") or best_note.get("commentCount")),
+        "shares": to_int(share_count),
+        "published_at": to_time_text(best_note.get("time") or best_note.get("createTime") or best_note.get("publishTime")),
+        "media_url": normalize_resource_url(media_url, final_url),
+    }
+
+
 def extract_from_html(url: str, text: str, final_url: str, platform: str) -> Dict[str, Any]:
     platform = detect_platform(url)
+    if platform == "小红书":
+        return extract_xiaohongshu_meta(url, text, final_url)
+
     metas = {
         "title": meta_content(text, "og:title", "twitter:title", "title") or title_tag(text),
         "description": meta_content(text, "description", "og:description", "twitter:description"),
@@ -1106,6 +1274,15 @@ def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Opt
 def classify_processing_error(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
+    if (
+        "eof occurred in violation of protocol" in lowered
+        or "_ssl.c" in lowered
+        or "urlopen error" in lowered
+        or "timed out" in lowered
+        or "connection reset" in lowered
+        or "remote end closed connection" in lowered
+    ):
+        return "网络异常"
     if "刷新登录态" in text or "登录态" in text or "重新登录" in text or "login required" in lowered:
         return "需登录"
     if "cookie" in lowered or "cookies" in lowered or "需要登录 cookie" in lowered or "fresh cookies" in lowered:
@@ -1191,6 +1368,15 @@ def should_process_blank_record(record: Dict[str, Any], cfg: Dict[str, Any]) -> 
     status = as_text(fields.get(names["status"]))
     if not title and not caption and not status:
         return True
+    return bool(title and not caption and status in RETRY_TRANSCRIPT_STATUSES)
+
+
+def should_transcribe_record(record: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    fields = record.get("fields") or {}
+    names = cfg["fields"]
+    title = as_text(fields.get(names["title"]))
+    caption = as_text(fields.get(names["caption"]))
+    status = as_text(fields.get(names["status"]))
     return bool(title and not caption and status in RETRY_TRANSCRIPT_STATUSES)
 
 
@@ -1474,7 +1660,7 @@ def webhook_worker(
             record = get_record(table_cfg, record_id)
             if not record:
                 raise RuntimeError(f"未找到记录：{record_id}")
-            result = process_record(record, table_cfg, field_types, transcribe=True)
+            result = process_record(record, table_cfg, field_types, transcribe=should_transcribe_record(record, table_cfg))
             print(f"{log_prefix}完成：table_id={table_id or '-'} record_id={record_id} -> {result}", flush=True)
         except Exception as e:
             print(f"{log_prefix}失败：table_id={table_id or '-'} record_id={record_id} -> {e}", flush=True)
@@ -1522,7 +1708,7 @@ def missed_record_scanner(
 ) -> None:
     while not stop_event.wait(max(5, interval)):
         try:
-            for table_id in feishu_table_ids(cfg):
+            for table_id in discover_feishu_table_ids(cfg):
                 table_cfg = with_table_id(cfg, table_id)
                 records = list_records(table_cfg)
                 record_ids = [
@@ -1636,12 +1822,14 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
     stop_event = threading.Event()
     pending: set[str] = set()
     pending_lock = threading.Lock()
-    worker = threading.Thread(
-        target=webhook_worker,
-        args=(cfg, jobs, stop_event, pending, pending_lock, "长连接"),
-        daemon=True,
-    )
-    worker.start()
+    worker_count = event_worker_count(cfg)
+    for index in range(worker_count):
+        worker = threading.Thread(
+            target=webhook_worker,
+            args=(cfg, jobs, stop_event, pending, pending_lock, f"长连接-{index + 1}"),
+            daemon=True,
+        )
+        worker.start()
 
     try:
         import lark_oapi as lark
@@ -1682,7 +1870,7 @@ def cmd_event_listener(args: argparse.Namespace) -> None:
         event_handler=event_handler,
         domain=base_url(feishu),
     )
-    print("飞书长连接监听已启动。按 Ctrl+C 停止。", flush=True)
+    print(f"飞书长连接监听已启动，worker={worker_count}。按 Ctrl+C 停止。", flush=True)
     try:
         client.start()
     except KeyboardInterrupt:

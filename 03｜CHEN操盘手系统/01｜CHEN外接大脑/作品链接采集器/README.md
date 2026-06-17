@@ -71,6 +71,7 @@ cp config.example.json config.json
 - `feishu.app_token`
 - `feishu.table_id`
 - `feishu.table_ids`（可选；复制表格后，把新表 URL 里的 `table=tbl...` 加到这里）
+- `feishu.auto_discover_tables`（可选；为 `true` 时自动扫描同一个多维表格应用下的所有数据表）
 
 `app_token` 和 `table_id` 从飞书多维表格 URL 里取：
 
@@ -78,7 +79,7 @@ cp config.example.json config.json
 https://xxx.feishu.cn/base/{app_token}?table={table_id}&view=...
 ```
 
-如果是在同一个知识库里复制出来的新表，`app_token` 通常不变，但 `table_id` 会变。监听服务只会处理 `feishu.table_id` 和 `feishu.table_ids` 里的表。
+如果是在同一个知识库里复制出来的新表，`app_token` 通常不变，但 `table_id` 会变。开启 `auto_discover_tables` 后，监听服务会自动发现同一个 `app_token` 下的其他数据表；字段结构一致的表可以直接复用补全功能。
 
 飞书自建应用需要开通 `bitable:app` 权限，并把应用添加为该多维表格的可编辑协作者。
 
@@ -303,6 +304,7 @@ cp config.server.example.json config.json
 - `feishu.app_token`
 - `feishu.table_id`
 - `feishu.table_ids`（可选，多张同结构表时填写）
+- `feishu.auto_discover_tables`（可选，自动扫描同一个多维表格应用下的所有数据表）
 
 如果需要处理受限抖音链接，把浏览器导出的 Netscape 格式 Cookie 放到：
 
