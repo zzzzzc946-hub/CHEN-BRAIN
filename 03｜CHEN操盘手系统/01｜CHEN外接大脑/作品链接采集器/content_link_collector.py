@@ -974,6 +974,19 @@ def multipart_form_data(fields: Dict[str, str], file_field: str, filename: str, 
     return b"".join(chunks), boundary
 
 
+def attachment_parent_node(cfg: Dict[str, Any]) -> str:
+    feishu = require_feishu(cfg)
+    app_token = feishu["app_token"]
+    token = tenant_access_token(cfg)
+    endpoint = "/open-apis/wiki/v2/spaces/get_node?" + urllib.parse.urlencode({"token": app_token})
+    status, payload = http_json("GET", base_url(feishu) + endpoint, token=token)
+    if status == 200 and isinstance(payload, dict) and payload.get("code") == 0:
+        node = ((payload.get("data") or {}).get("node") or {})
+        if node.get("obj_type") == "bitable" and node.get("obj_token"):
+            return str(node["obj_token"])
+    return app_token
+
+
 def upload_cover_to_feishu(cfg: Dict[str, Any], cover_url: str, platform: str) -> Optional[str]:
     """Best-effort upload for attachment/image fields. If Feishu rejects it, caller falls back to URL."""
     if not cover_url:
@@ -985,7 +998,7 @@ def upload_cover_to_feishu(cfg: Dict[str, Any], cover_url: str, platform: str) -
             {
                 "file_name": "cover" + ext,
                 "parent_type": "bitable_image",
-                "parent_node": feishu["app_token"],
+                "parent_node": attachment_parent_node(cfg),
                 "size": str(len(data)),
             },
             "file",

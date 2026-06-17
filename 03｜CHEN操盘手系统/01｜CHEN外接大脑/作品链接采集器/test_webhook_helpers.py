@@ -90,6 +90,36 @@ class WebhookHelperTests(unittest.TestCase):
             "https://p3-sign.douyinpic.com/full-cover.webp",
         )
 
+    def test_attachment_parent_node_uses_wiki_obj_token_when_available(self):
+        collector = load_collector()
+        calls = []
+
+        def fake_http_json(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return 200, {
+                "code": 0,
+                "data": {
+                    "node": {
+                        "obj_type": "bitable",
+                        "obj_token": "real_bitable_token",
+                    }
+                },
+            }
+
+        collector.http_json = fake_http_json
+        cfg = {
+            "feishu": {
+                "app_id": "cli_x",
+                "app_secret": "secret",
+                "app_token": "wiki_node_token",
+                "table_id": "tbl_x",
+                "base_url": "https://open.feishu.cn",
+            }
+        }
+
+        self.assertEqual(collector.attachment_parent_node(cfg), "real_bitable_token")
+        self.assertIn("/open-apis/wiki/v2/spaces/get_node?token=wiki_node_token", calls[0][1])
+
     def test_transcribe_from_meta_removes_temp_media_dir_when_asr_fails(self):
         collector = load_collector()
         temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
