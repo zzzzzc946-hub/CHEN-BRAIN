@@ -192,6 +192,35 @@ class WebhookHelperTests(unittest.TestCase):
             "网络异常",
         )
 
+    def test_tencent_rec_task_payload_uses_local_audio_data(self):
+        collector = load_collector()
+
+        payload = collector.tencent_create_rec_task_payload(b"abc123", {"engine_model_type": "16k_zh"})
+
+        self.assertEqual(payload["EngineModelType"], "16k_zh")
+        self.assertEqual(payload["ChannelNum"], 1)
+        self.assertEqual(payload["ResTextFormat"], 3)
+        self.assertEqual(payload["SourceType"], 1)
+        self.assertEqual(payload["Data"], "YWJjMTIz")
+        self.assertEqual(payload["DataLen"], 6)
+
+    def test_clean_tencent_transcript_removes_timestamps(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.clean_tencent_transcript("[0:0.020,0:2.380]  腾讯云语音识别欢迎您。\n[0:2.4,0:3.0] 第二句。"),
+            "腾讯云语音识别欢迎您。\n第二句。",
+        )
+
+    def test_tencent_audio_size_guard_falls_back_to_local(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "audio.mp3"
+            audio.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
+
+            with self.assertRaisesRegex(RuntimeError, "腾讯云本地音频上传限制"):
+                collector.tencent_transcribe_file({"tencent_asr": {}}, audio)
+
     def test_should_transcribe_record_only_after_metadata_sync(self):
         collector = load_collector()
         cfg = {"fields": collector.DEFAULT_FIELDS}

@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -155,6 +158,15 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg.setdefault("openai", {})
     cfg["openai"].setdefault("transcribe_model", "gpt-4o-transcribe")
     cfg["openai"].setdefault("language", "zh")
+    cfg.setdefault("tencent_asr", {})
+    cfg["tencent_asr"].setdefault("secret_id", os.environ.get("TENCENTCLOUD_SECRET_ID", ""))
+    cfg["tencent_asr"].setdefault("secret_key", os.environ.get("TENCENTCLOUD_SECRET_KEY", ""))
+    cfg["tencent_asr"].setdefault("region", os.environ.get("TENCENTCLOUD_REGION", "ap-shanghai"))
+    cfg["tencent_asr"].setdefault("engine_model_type", "16k_zh")
+    cfg["tencent_asr"].setdefault("res_text_format", 3)
+    cfg["tencent_asr"].setdefault("max_local_upload_mb", 5)
+    cfg["tencent_asr"].setdefault("poll_interval", 3)
+    cfg["tencent_asr"].setdefault("timeout", 180)
     cfg.setdefault("webhook", {})
     cfg["webhook"].setdefault("verification_token", "")
     cfg.setdefault("event", {})
@@ -709,6 +721,158 @@ def openai_transcribe_file(cfg: Dict[str, Any], path: Path) -> str:
     return text
 
 
+def load_tencent_asr_credentials(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    load_dotenv()
+    tencent_cfg = cfg.get("tencent_asr") or {}
+    secret_id = (os.environ.get("TENCENTCLOUD_SECRET_ID") or tencent_cfg.get("secret_id") or "").strip()
+    secret_key = (os.environ.get("TENCENTCLOUD_SECRET_KEY") or tencent_cfg.get("secret_key") or "").strip()
+    if not secret_id or not secret_key:
+        raise RuntimeError("缺少腾讯云 ASR 密钥：请配置 tencent_asr.secret_id / secret_key。")
+    return secret_id, secret_key
+
+
+def tencent_create_rec_task_payload(audio: bytes, tencent_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "EngineModelType": tencent_cfg.get("engine_model_type") or "16k_zh",
+        "ChannelNum": int(tencent_cfg.get("channel_num") or 1),
+        "ResTextFormat": int(tencent_cfg.get("res_text_format") or 3),
+        "SourceType": 1,
+        "Data": base64.b64encode(audio).decode("ascii"),
+        "DataLen": len(audio),
+        "FilterDirty": 0,
+        "FilterPunc": 0,
+        "FilterModal": 0,
+        "ConvertNumMode": 1,
+    }
+
+
+def tencent_tc3_headers(
+    secret_id: str,
+    secret_key: str,
+    action: str,
+    payload: bytes,
+    region: str,
+    timestamp: Optional[int] = None,
+) -> Dict[str, str]:
+    service = "asr"
+    host = "asr.tencentcloudapi.com"
+    version = "2019-06-14"
+    timestamp = int(timestamp or time.time())
+    date = dt.datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
+    hashed_payload = hashlib.sha256(payload).hexdigest()
+    canonical_headers = f"content-type:application/json; charset=utf-8\nhost:{host}\n"
+    signed_headers = "content-type;host"
+    canonical_request = "\n".join(["POST", "/", "", canonical_headers, signed_headers, hashed_payload])
+    credential_scope = f"{date}/{service}/tc3_request"
+    string_to_sign = "\n".join([
+        "TC3-HMAC-SHA256",
+        str(timestamp),
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    def sign(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    secret_date = sign(("TC3" + secret_key).encode("utf-8"), date)
+    secret_service = sign(secret_date, service)
+    secret_signing = sign(secret_service, "tc3_request")
+    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        "TC3-HMAC-SHA256 "
+        f"Credential={secret_id}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        "Authorization": authorization,
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": host,
+        "X-TC-Action": action,
+        "X-TC-Version": version,
+        "X-TC-Timestamp": str(timestamp),
+        "X-TC-Region": region,
+    }
+
+
+def tencent_asr_request(cfg: Dict[str, Any], action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    secret_id, secret_key = load_tencent_asr_credentials(cfg)
+    tencent_cfg = cfg.get("tencent_asr") or {}
+    region = tencent_cfg.get("region") or "ap-shanghai"
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        "https://asr.tencentcloudapi.com/",
+        data=body,
+        headers=tencent_tc3_headers(secret_id, secret_key, action, body, region),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"腾讯云 ASR 请求失败 HTTP {e.code}: {raw[:500]}")
+    response = data.get("Response") or {}
+    if response.get("Error"):
+        err = response["Error"]
+        raise RuntimeError(f"腾讯云 ASR 失败：{err.get('Code') or ''} {err.get('Message') or ''}".strip())
+    return response
+
+
+def clean_tencent_transcript(text: str) -> str:
+    lines: List[str] = []
+    for line in (text or "").splitlines():
+        clean = re.sub(r"^\s*\[[^\]]+\]\s*", "", line).strip()
+        if clean:
+            lines.append(clean)
+    return "\n".join(lines).strip()
+
+
+def tencent_result_text(data: Dict[str, Any]) -> str:
+    details = data.get("ResultDetail") or []
+    sentences = [
+        str(item.get("FinalSentence") or "").strip()
+        for item in details
+        if isinstance(item, dict) and str(item.get("FinalSentence") or "").strip()
+    ]
+    if sentences:
+        return "\n".join(sentences).strip()
+    return clean_tencent_transcript(str(data.get("Result") or ""))
+
+
+def tencent_transcribe_file(cfg: Dict[str, Any], path: Path) -> str:
+    tencent_cfg = cfg.get("tencent_asr") or {}
+    max_bytes = int(float(tencent_cfg.get("max_local_upload_mb") or 5) * 1024 * 1024)
+    audio_size = path.stat().st_size
+    if audio_size > max_bytes:
+        raise RuntimeError(f"腾讯云本地音频上传限制：{audio_size} bytes > {max_bytes} bytes；已切本地转写。")
+    response = tencent_asr_request(
+        cfg,
+        "CreateRecTask",
+        tencent_create_rec_task_payload(path.read_bytes(), tencent_cfg),
+    )
+    task_id = ((response.get("Data") or {}).get("TaskId"))
+    if task_id is None:
+        raise RuntimeError("腾讯云 ASR 未返回 TaskId。")
+
+    deadline = time.time() + int(tencent_cfg.get("timeout") or 180)
+    interval = max(1, int(tencent_cfg.get("poll_interval") or 3))
+    last_status = ""
+    while time.time() < deadline:
+        time.sleep(interval)
+        status_resp = tencent_asr_request(cfg, "DescribeTaskStatus", {"TaskId": int(task_id)})
+        data = status_resp.get("Data") or {}
+        status = int(data.get("Status") if data.get("Status") is not None else -1)
+        last_status = str(data.get("StatusStr") or status)
+        if status == 2:
+            text = tencent_result_text(data)
+            if not text:
+                raise RuntimeError("腾讯云 ASR 返回为空。")
+            return text
+        if status == 3:
+            raise RuntimeError("腾讯云 ASR 任务失败：" + str(data.get("ErrorMsg") or last_status))
+    raise RuntimeError(f"腾讯云 ASR 超时，最后状态：{last_status or 'unknown'}")
+
+
 def local_whisper_transcribe_file(cfg: Dict[str, Any], path: Path) -> str:
     try:
         import whisper  # type: ignore
@@ -766,6 +930,16 @@ def format_transcript_text(text: str) -> str:
 
 def transcribe_audio_file(cfg: Dict[str, Any], path: Path) -> str:
     backend = ((cfg.get("asr") or {}).get("backend") or "local").lower()
+    if backend == "tencent":
+        return tencent_transcribe_file(cfg, path)
+    if backend == "tencent_auto":
+        try:
+            return tencent_transcribe_file(cfg, path)
+        except Exception as tencent_error:
+            try:
+                return local_whisper_transcribe_file(cfg, path)
+            except Exception as local_error:
+                raise RuntimeError(f"腾讯云 ASR 失败：{tencent_error}；本地 Whisper 失败：{local_error}")
     if backend == "openai":
         return openai_transcribe_file(cfg, path)
     if backend == "local":
@@ -778,7 +952,7 @@ def transcribe_audio_file(cfg: Dict[str, Any], path: Path) -> str:
                 return openai_transcribe_file(cfg, path)
             except Exception as openai_error:
                 raise RuntimeError(f"本地 Whisper 失败：{local_error}；OpenAI 失败：{openai_error}")
-    raise RuntimeError(f"未知 ASR backend：{backend}，可用值：local / openai / auto")
+    raise RuntimeError(f"未知 ASR backend：{backend}，可用值：local / openai / auto / tencent / tencent_auto")
 
 
 def transcribe_from_meta(cfg: Dict[str, Any], meta: Dict[str, Any]) -> str:
