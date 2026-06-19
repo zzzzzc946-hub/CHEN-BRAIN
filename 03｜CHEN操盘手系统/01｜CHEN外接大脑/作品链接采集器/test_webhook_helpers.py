@@ -265,6 +265,21 @@ class WebhookHelperTests(unittest.TestCase):
 
         self.assertEqual(objects[-1]["note"]["title"], "小红书标题")
 
+    def test_iter_json_objects_reads_xiaohongshu_initial_state_with_undefined(self):
+        collector = load_collector()
+        html = (
+            '<script>window.__INITIAL_STATE__={"feed":undefined,'
+            '"note":{"noteDetailMap":{"target":{"note":{"noteId":"target","type":"video"}}}}};</script>'
+        )
+
+        objects = list(collector.iter_json_objects(html))
+
+        self.assertIsNone(objects[-1]["feed"])
+        self.assertEqual(
+            objects[-1]["note"]["noteDetailMap"]["target"]["note"]["noteId"],
+            "target",
+        )
+
     def test_extract_xiaohongshu_image_note_writes_body_as_caption(self):
         collector = load_collector()
         html = """
@@ -313,7 +328,7 @@ class WebhookHelperTests(unittest.TestCase):
             "title": "视频笔记",
             "desc": "这是视频简介，不是逐字稿",
             "cover": {"url": "https://ci.xiaohongshu.com/video-cover.jpg"},
-            "interactInfo": {"likedCount": 12, "commentCount": 3, "collectedCount": 4},
+            "interactInfo": {"likedCount": 12, "commentCount": 3, "shareCount": 4, "collectedCount": 9},
             "video": {"media": {"stream": {"h264": [{"masterUrl": "https://sns-video-hw.xhscdn.com/video.mp4"}]}}, "duration": 83000}
           }
         };</script></html>
@@ -327,6 +342,110 @@ class WebhookHelperTests(unittest.TestCase):
         self.assertEqual(meta["duration"], "01:23")
         self.assertEqual(meta["media_url"], "https://sns-video-hw.xhscdn.com/video.mp4")
         self.assertEqual(meta["shares"], 4)
+
+    def test_extract_xiaohongshu_does_not_treat_collections_as_shares(self):
+        collector = load_collector()
+        html = """
+        <script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{"abc":{"note":{
+          "noteId":"abc",
+          "type":"normal",
+          "title":"图文",
+          "desc":"正文",
+          "interactInfo":{"likedCount":"3","commentCount":"2","collectedCount":"99"},
+          "imageList":[{"urlDefault":"https://ci.xiaohongshu.com/cover.jpg"}]
+        }}}}};</script>
+        """
+
+        meta = collector.extract_xiaohongshu_meta(
+            "https://www.xiaohongshu.com/explore/abc",
+            html,
+            "https://www.xiaohongshu.com/explore/abc",
+        )
+
+        self.assertIsNone(meta["shares"])
+
+    def test_extract_xiaohongshu_video_note_matches_url_id_and_reads_current_schema(self):
+        collector = load_collector()
+        html = """
+        <html>
+        <meta name="og:title" content="错误的元标签标题 - 小红书">
+        <script>window.__INITIAL_STATE__={
+          "feed": undefined,
+          "note": {
+            "noteDetailMap": {
+              "other": {"note": {
+                "noteId": "other",
+                "type": "normal",
+                "title": "不应选中的图文",
+                "desc": "错误正文",
+                "imageList": [{"urlDefault": "https://ci.xiaohongshu.com/wrong.jpg"}]
+              }},
+              "6a23fe8c000000003503bc2a": {"note": {
+                "noteId": "6a23fe8c000000003503bc2a",
+                "type": "video",
+                "title": "Jason谈展示面三要素（第一期：颜值）",
+                "desc": "#男性情感[话题]# #展示面[话题]#",
+                "time": 1780743820000,
+                "interactInfo": {
+                  "likedCount": "14",
+                  "commentCount": "2",
+                  "shareCount": "1"
+                },
+                "imageList": [{"urlDefault": "https://ci.xiaohongshu.com/right.jpg"}],
+                "video": {
+                  "media": {
+                    "video": {"duration": 132},
+                    "stream": {
+                      "h264": [{
+                        "masterUrl": "https://sns-video-v4.xhscdn.com/target.mp4",
+                        "videoDuration": 131900
+                      }]
+                    }
+                  }
+                }
+              }}
+            }
+          }
+        };</script></html>
+        """
+
+        meta = collector.extract_xiaohongshu_meta(
+            "https://www.xiaohongshu.com/discovery/item/6a23fe8c000000003503bc2a",
+            html,
+            "https://www.xiaohongshu.com/explore/6a23fe8c000000003503bc2a",
+        )
+
+        self.assertEqual(meta["content_type"], "video")
+        self.assertEqual(meta["title"], "Jason谈展示面三要素（第一期：颜值）")
+        self.assertEqual(meta["caption"], "")
+        self.assertEqual(meta["cover_url"], "https://ci.xiaohongshu.com/right.jpg")
+        self.assertEqual(meta["duration"], "02:12")
+        self.assertEqual(meta["likes"], 14)
+        self.assertEqual(meta["comments"], 2)
+        self.assertEqual(meta["shares"], 1)
+        self.assertEqual(meta["published_at"], "2026年06月06日19时03分40秒")
+        self.assertEqual(meta["media_url"], "https://sns-video-v4.xhscdn.com/target.mp4")
+
+    def test_xiaohongshu_missing_metadata_is_reported_after_transcription(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.metadata_quality_message(
+                {
+                    "platform": "小红书",
+                    "content_type": "video",
+                    "title": "视频标题",
+                    "cover_url": "https://example.com/cover.jpg",
+                    "media_url": "https://example.com/video.mp4",
+                    "duration": "01:00",
+                    "likes": None,
+                    "comments": None,
+                    "shares": None,
+                    "published_at": "",
+                }
+            ),
+            "小红书页面未暴露或未解析到：点赞、评论、分享、发布时间。",
+        )
 
     def test_attachment_parent_node_uses_wiki_obj_token_when_available(self):
         collector = load_collector()

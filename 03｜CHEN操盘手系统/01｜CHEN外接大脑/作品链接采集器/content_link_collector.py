@@ -985,6 +985,50 @@ def title_tag(text: str) -> str:
     return html.unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else ""
 
 
+def javascript_object_to_json(raw: str) -> str:
+    """Replace bare JavaScript literals without touching quoted text."""
+    replacements = {"undefined": "null", "NaN": "null", "Infinity": "null"}
+    out: List[str] = []
+    quote = ""
+    escaped = False
+    i = 0
+    while i < len(raw):
+        char = raw[i]
+        if quote:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            i += 1
+            continue
+        if char in ('"', "'"):
+            quote = char
+            out.append(char)
+            i += 1
+            continue
+        replaced = False
+        for source, target in replacements.items():
+            if not raw.startswith(source, i):
+                continue
+            before = raw[i - 1] if i else ""
+            after_index = i + len(source)
+            after = raw[after_index] if after_index < len(raw) else ""
+            if (not before or not (before.isalnum() or before in "_$")) and (
+                not after or not (after.isalnum() or after in "_$")
+            ):
+                out.append(target)
+                i = after_index
+                replaced = True
+                break
+        if not replaced:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
 def iter_json_objects(text: str) -> Iterable[Any]:
     render = re.search(r'<script[^>]+id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>', text, flags=re.I | re.S)
     if render:
@@ -1000,7 +1044,7 @@ def iter_json_objects(text: str) -> Iterable[Any]:
             continue
         raw = html.unescape(text[index + len(marker):]).lstrip()
         try:
-            obj, _ = json.JSONDecoder().raw_decode(raw)
+            obj, _ = json.JSONDecoder().raw_decode(javascript_object_to_json(raw))
             yield obj
         except Exception:
             continue
@@ -1134,6 +1178,12 @@ def clean_title(raw: str) -> str:
     return raw
 
 
+def xhs_note_id_from_url(url: str) -> str:
+    path = urllib.parse.urlparse(url).path
+    match = re.search(r"/(?:item|explore)/([A-Za-z0-9]+)", path)
+    return match.group(1) if match else ""
+
+
 def xhs_note_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
     if isinstance(obj, dict):
         note = obj.get("note")
@@ -1141,13 +1191,17 @@ def xhs_note_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
             yield note
         note_map = obj.get("noteDetailMap") or obj.get("note_detail_map")
         if isinstance(note_map, dict):
-            for item in note_map.values():
+            for note_id, item in note_map.items():
                 if isinstance(item, dict):
                     nested = item.get("note") or item.get("noteDetail") or item.get("detail")
                     if isinstance(nested, dict):
-                        yield nested
+                        candidate = dict(nested)
+                        candidate.setdefault("_map_note_id", note_id)
+                        yield candidate
                     elif any(k in item for k in ("title", "desc", "interactInfo", "video", "imageList")):
-                        yield item
+                        candidate = dict(item)
+                        candidate.setdefault("_map_note_id", note_id)
+                        yield candidate
         for value in obj.values():
             yield from xhs_note_candidates(value)
     elif isinstance(obj, list):
@@ -1172,49 +1226,72 @@ def xhs_cover_url(note: Dict[str, Any]) -> str:
 
 
 def extract_xiaohongshu_meta(url: str, text: str, final_url: str) -> Dict[str, Any]:
-    best_note: Dict[str, Any] = {}
+    candidates: List[Dict[str, Any]] = []
     for obj in iter_json_objects(text):
         for note in xhs_note_candidates(obj):
             if note.get("title") or note.get("desc") or note.get("interactInfo") or note.get("video") or note.get("imageList"):
-                best_note = note
-                break
-        if best_note:
-            break
+                candidates.append(note)
+
+    target_note_id = xhs_note_id_from_url(final_url) or xhs_note_id_from_url(url)
+
+    def note_score(note: Dict[str, Any]) -> int:
+        note_id = str(note.get("noteId") or note.get("note_id") or note.get("id") or note.get("_map_note_id") or "")
+        score = 1000 if target_note_id and note_id == target_note_id else 0
+        score += 10 if note.get("title") else 0
+        score += 8 if note.get("interactInfo") or note.get("interact_info") else 0
+        score += 6 if note.get("video") or note.get("videoInfo") or note.get("video_info") else 0
+        score += 4 if note.get("imageList") or note.get("image_list") else 0
+        return score
+
+    best_note = max(candidates, key=note_score) if candidates else {}
 
     metas = {
         "title": meta_content(text, "og:title", "twitter:title", "title") or title_tag(text),
         "description": meta_content(text, "description", "og:description", "twitter:description"),
         "cover_url": meta_content(text, "og:image", "twitter:image"),
+        "video_url": meta_content(text, "og:video"),
+        "video_time": meta_content(text, "og:videotime"),
+        "likes": meta_content(text, "og:xhs:note_like"),
+        "comments": meta_content(text, "og:xhs:note_comment"),
     }
 
     interact = best_note.get("interactInfo") or best_note.get("interact_info") or {}
     title = clean_title(str(best_note.get("title") or best_note.get("displayTitle") or metas["title"] or ""))
     desc = str(best_note.get("desc") or best_note.get("description") or metas["description"] or "").strip()
-    media_url = xhs_video_url(best_note)
+    media_url = xhs_video_url(best_note) or metas["video_url"]
     is_video = bool(media_url or str(best_note.get("type") or "").lower() == "video" or best_note.get("video"))
     cover_url = xhs_cover_url(best_note) or metas["cover_url"]
-    duration = pick_first_json(best_note, ["duration", "videoDuration", "video_duration"])
+    duration = pick_first_json(best_note, ["duration", "videoDuration", "video_duration"]) or metas["video_time"]
 
     share_count = (
         interact.get("shareCount")
         or interact.get("share_count")
         or best_note.get("shareCount")
         or best_note.get("share_count")
-        or interact.get("collectedCount")
-        or interact.get("collectCount")
-        or interact.get("collected_count")
     )
 
     return {
         "source_url": url,
         "final_url": final_url,
         "platform": "小红书",
+        "content_type": "video" if is_video else "image",
         "title": title or desc[:80],
         "caption": "" if is_video else desc,
         "cover_url": normalize_resource_url(cover_url, final_url),
         "duration": to_duration(duration) if is_video else "图文",
-        "likes": to_int(interact.get("likedCount") or interact.get("likeCount") or interact.get("liked_count") or best_note.get("likedCount")),
-        "comments": to_int(interact.get("commentCount") or interact.get("comment_count") or best_note.get("commentCount")),
+        "likes": to_int(
+            interact.get("likedCount")
+            or interact.get("likeCount")
+            or interact.get("liked_count")
+            or best_note.get("likedCount")
+            or metas["likes"]
+        ),
+        "comments": to_int(
+            interact.get("commentCount")
+            or interact.get("comment_count")
+            or best_note.get("commentCount")
+            or metas["comments"]
+        ),
         "shares": to_int(share_count),
         "published_at": to_time_text(best_note.get("time") or best_note.get("createTime") or best_note.get("publishTime")),
         "media_url": normalize_resource_url(media_url, final_url),
@@ -1435,6 +1512,28 @@ def build_update_fields(cfg: Dict[str, Any], meta: Dict[str, Any], field_types: 
     return keep_existing_fields({k: v for k, v in out.items() if k and v is not None}, field_types)
 
 
+def metadata_quality_message(meta: Dict[str, Any]) -> str:
+    if meta.get("platform") != "小红书":
+        return ""
+    missing: List[str] = []
+    for key, label in (
+        ("title", "作品标题"),
+        ("cover_url", "封面"),
+        ("duration", "时长"),
+        ("likes", "点赞"),
+        ("comments", "评论"),
+        ("shares", "分享"),
+        ("published_at", "发布时间"),
+    ):
+        if meta.get(key) in (None, ""):
+            missing.append(label)
+    if meta.get("content_type") == "video" and not media_url_or_empty(meta):
+        missing.append("视频直链")
+    if not missing:
+        return ""
+    return "小红书页面未暴露或未解析到：" + "、".join(missing) + "。"
+
+
 def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     names = cfg["fields"]
     fields = {
@@ -1568,15 +1667,23 @@ def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dic
     meta = extract_from_page(url, cfg)
     update_fields = build_update_fields(cfg, meta, field_types)
     needs_asr = bool(not meta.get("caption") and not str(meta.get("duration") or "").endswith("图"))
+    quality_message = metadata_quality_message(meta)
     if not meta.get("title"):
         update_fields.update(status_fields(cfg, "平台限制", "已访问链接，但页面没有暴露标题；可能需要登录 Cookie、刷新登录态或官方接口。", field_types))
     elif not meta.get("caption"):
         if str(meta.get("duration") or "").endswith("图"):
-            update_fields.update(status_fields(cfg, "图文作品", "已抓到作品信息；这是图文作品，没有视频逐字稿。", field_types))
+            message = "已抓到作品信息；这是图文作品，没有视频逐字稿。"
+            if quality_message:
+                message += quality_message
+            update_fields.update(status_fields(cfg, "图文作品", message, field_types))
         else:
             status = "转写中" if transcribe else "待转写"
             message = "已抓到作品信息和封面；页面没有自带字幕，等待视频音频 ASR 转写。"
+            if quality_message:
+                message += quality_message
             update_fields.update(status_fields(cfg, status, message, field_types))
+    elif quality_message:
+        update_fields.update(status_fields(cfg, "信息不完整", quality_message, field_types))
     if update_fields:
         update_record(cfg, record_id, update_fields)
 
@@ -1589,9 +1696,9 @@ def process_record(record: Dict[str, Any], cfg: Dict[str, Any], field_types: Dic
             return "failed"
         update_record(cfg, record_id, keep_existing_fields({
             names["caption"]: text,
-            names["status"]: "成功",
+            names["status"]: "信息不完整" if quality_message else "成功",
             names["fetched_at"]: now_text(),
-            names["error"]: "",
+            names["error"]: quality_message,
         }, field_types))
         return "transcribed"
     if needs_asr and not transcribe:
