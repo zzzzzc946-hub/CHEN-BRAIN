@@ -1,5 +1,7 @@
 import importlib.util
+import queue
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -120,6 +122,31 @@ class WebhookHelperTests(unittest.TestCase):
         self.assertEqual(collector.event_worker_count({}), 3)
         self.assertEqual(collector.event_worker_count({"event": {"worker_count": 0}}), 1)
         self.assertEqual(collector.event_worker_count({"event": {"worker_count": 99}}), 8)
+
+    def test_scan_missing_records_continues_after_one_table_times_out(self):
+        collector = load_collector()
+        cfg = {"feishu": {"table_id": "bad"}, "fields": collector.DEFAULT_FIELDS}
+        jobs = queue.Queue()
+        pending = set()
+        pending_lock = threading.Lock()
+
+        collector.discover_feishu_table_ids = lambda cfg: ["bad", "good"]
+
+        def fake_list_records(table_cfg):
+            if table_cfg["feishu"]["table_id"] == "bad":
+                raise TimeoutError("first table timed out")
+            return [
+                {
+                    "record_id": "recGoodRecord123",
+                    "fields": {"作品链接": "https://www.douyin.com/video/123456789"},
+                }
+            ]
+
+        collector.list_records = fake_list_records
+
+        collector.scan_missing_records_once(cfg, jobs, pending, pending_lock)
+
+        self.assertEqual(jobs.get_nowait(), ("good", "recGoodRecord123"))
 
     def test_should_process_blank_record_only_for_new_link_rows(self):
         collector = load_collector()

@@ -1979,6 +1979,26 @@ def queue_record_ids(
     return queued
 
 
+def scan_missing_records_once(
+    cfg: Dict[str, Any],
+    jobs: "queue.Queue[Tuple[str, str]]",
+    pending: set[str],
+    pending_lock: threading.Lock,
+) -> None:
+    for table_id in discover_feishu_table_ids(cfg):
+        try:
+            table_cfg = with_table_id(cfg, table_id)
+            records = list_records(table_cfg)
+            record_ids = [
+                record.get("record_id") or ""
+                for record in records
+                if should_process_blank_record(record, table_cfg)
+            ]
+            queue_record_ids(jobs, pending, pending_lock, record_ids, "补扫", table_id)
+        except Exception as e:
+            print(f"补扫失败：table_id={table_id} -> {e}", flush=True)
+
+
 def missed_record_scanner(
     cfg: Dict[str, Any],
     jobs: "queue.Queue[Tuple[str, str]]",
@@ -1989,17 +2009,9 @@ def missed_record_scanner(
 ) -> None:
     while not stop_event.wait(max(5, interval)):
         try:
-            for table_id in discover_feishu_table_ids(cfg):
-                table_cfg = with_table_id(cfg, table_id)
-                records = list_records(table_cfg)
-                record_ids = [
-                    record.get("record_id") or ""
-                    for record in records
-                    if should_process_blank_record(record, table_cfg)
-                ]
-                queue_record_ids(jobs, pending, pending_lock, record_ids, "补扫", table_id)
+            scan_missing_records_once(cfg, jobs, pending, pending_lock)
         except Exception as e:
-            print(f"补扫失败：{e}", flush=True)
+            print(f"补扫失败：自动发现数据表 -> {e}", flush=True)
 
 
 def make_webhook_handler(cfg: Dict[str, Any], jobs: "queue.Queue[Tuple[str, str]]"):
