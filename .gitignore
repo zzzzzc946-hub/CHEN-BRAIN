@@ -38,6 +38,24 @@ yarn-error.log*
 *.swo
 *~
 
+# Git worktrees
+.worktrees/
+worktrees/
+
+# Local app/runtime artifacts
+**/browser-profile-cdp/
+**/*.sqlite3
+**/*.sqlite3-*
+**/.feishu_token_cache.json
+**/logs/
+**/*.app/
+**/*.tgz
+**/cloudflared
+**/cloudflared-darwin-arm64.tgz
+
+# Superpowers local scratch
+.superpowers/
+
 # Local environment secrets
 .env
 .env.*
