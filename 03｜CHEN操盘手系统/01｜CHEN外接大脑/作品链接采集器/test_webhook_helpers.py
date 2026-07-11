@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import queue
+import shutil
 import tempfile
 import threading
 import unittest
@@ -119,7 +121,7 @@ class WebhookHelperTests(unittest.TestCase):
     def test_event_worker_count_defaults_and_clamps(self):
         collector = load_collector()
 
-        self.assertEqual(collector.event_worker_count({}), 3)
+        self.assertEqual(collector.event_worker_count({}), 1)
         self.assertEqual(collector.event_worker_count({"event": {"worker_count": 0}}), 1)
         self.assertEqual(collector.event_worker_count({"event": {"worker_count": 99}}), 8)
 
@@ -148,6 +150,215 @@ class WebhookHelperTests(unittest.TestCase):
 
         self.assertEqual(jobs.get_nowait(), ("good", "recGoodRecord123"))
 
+    def test_scanner_heartbeat_marks_started_and_finished(self):
+        collector = load_collector()
+        state = {}
+
+        collector.mark_scanner_heartbeat(state, "running")
+        first_seen = state["last_seen"]
+
+        collector.mark_scanner_heartbeat(state, "finished")
+
+        self.assertEqual(state["status"], "finished")
+        self.assertGreaterEqual(state["last_seen"], first_seen)
+
+    def test_scanner_watchdog_exits_when_heartbeat_is_stale(self):
+        collector = load_collector()
+        state = {"last_seen": 100.0, "status": "running"}
+
+        self.assertTrue(collector.scanner_heartbeat_stale(state, interval=15, now=161.0))
+        self.assertFalse(collector.scanner_heartbeat_stale(state, interval=15, now=120.0))
+
+    def test_login_url_for_supported_platforms(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.login_url_for_platform("抖音"), "https://www.douyin.com/")
+        self.assertEqual(collector.login_url_for_platform("小红书"), "https://www.xiaohongshu.com/")
+        self.assertEqual(collector.login_url_for_platform("B站"), "https://www.bilibili.com/")
+        self.assertEqual(collector.login_url_for_platform("YouTube"), "https://www.youtube.com/")
+        self.assertEqual(collector.login_url_for_platform("Instagram"), "https://www.instagram.com/")
+        self.assertEqual(collector.login_url_for_platform("未知"), "")
+
+    def test_detect_platform_for_bilibili_links(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.detect_platform("https://www.bilibili.com/video/BV1xx411c7mD/"), "B站")
+        self.assertEqual(collector.detect_platform("https://m.bilibili.com/video/av123456"), "B站")
+        self.assertEqual(collector.detect_platform("https://b23.tv/abc123"), "B站")
+
+    def test_detect_platform_for_youtube_and_instagram_links(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.detect_platform("https://www.youtube.com/watch?v=abc123xyz90"), "YouTube")
+        self.assertEqual(collector.detect_platform("https://youtu.be/abc123xyz90"), "YouTube")
+        self.assertEqual(collector.detect_platform("https://www.youtube.com/shorts/abc123xyz90"), "YouTube")
+        self.assertEqual(collector.detect_platform("https://www.instagram.com/reel/ABCdef123/"), "Instagram")
+        self.assertEqual(collector.detect_platform("https://instagram.com/p/ABCdef123/"), "Instagram")
+
+    def test_bilibili_ids_from_url_reads_bv_and_av(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.bilibili_bvid_from_url("https://www.bilibili.com/video/BV1xx411c7mD/"), "BV1xx411c7mD")
+        self.assertEqual(collector.bilibili_aid_from_url("https://www.bilibili.com/video/av123456"), "123456")
+
+    def test_bilibili_view_to_meta_extracts_core_fields(self):
+        collector = load_collector()
+        payload = {
+            "title": "测试 B站视频",
+            "desc": "这是简介，不应该当逐字稿",
+            "pic": "//i0.hdslb.com/bfs/archive/cover.jpg",
+            "duration": 95,
+            "pubdate": 1710000000,
+            "stat": {"like": 12, "reply": 3, "share": 4},
+        }
+
+        meta = collector.bilibili_view_to_meta("https://www.bilibili.com/video/BVabc", "https://www.bilibili.com/video/BVabc", payload)
+
+        self.assertEqual(meta["platform"], "B站")
+        self.assertEqual(meta["content_type"], "video")
+        self.assertEqual(meta["title"], "测试 B站视频")
+        self.assertEqual(meta["caption"], "")
+        self.assertEqual(meta["cover_url"], "https://i0.hdslb.com/bfs/archive/cover.jpg")
+        self.assertEqual(meta["duration"], "01:35")
+        self.assertEqual(meta["likes"], 12)
+        self.assertEqual(meta["comments"], 3)
+        self.assertEqual(meta["shares"], 4)
+        self.assertTrue(meta["published_at"])
+
+    def test_bilibili_extract_from_page_uses_api_then_ytdlp_for_media(self):
+        collector = load_collector()
+        cfg = {"yt_dlp": {"enabled": True}, "platforms": {}}
+
+        collector.fetch_text = lambda url, cfg, platform: ("<html></html>", url)
+        collector.extract_bilibili_api = lambda url, cfg: {
+            "source_url": url,
+            "final_url": url,
+            "platform": "B站",
+            "content_type": "video",
+            "title": "API标题",
+            "caption": "",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "02:00",
+            "likes": 1,
+            "comments": 2,
+            "shares": 3,
+            "published_at": "2026年01月01日00时00分00秒",
+            "media_url": "",
+        }
+        collector.extract_with_ytdlp = lambda url, cfg: {"media_url": "https://example.com/video.mp4", "title": "yt标题"}
+
+        meta = collector.extract_from_page("https://www.bilibili.com/video/BVabc123", cfg)
+
+        self.assertEqual(meta["platform"], "B站")
+        self.assertEqual(meta["title"], "API标题")
+        self.assertEqual(meta["media_url"], "https://example.com/video.mp4")
+
+    def test_webhook_worker_transcribes_new_blank_records(self):
+        collector = load_collector()
+        jobs = queue.Queue()
+        jobs.put(("tblA", "recNew"))
+        stop_event = threading.Event()
+        captured = []
+        cfg = {"fields": collector.DEFAULT_FIELDS, "feishu": {"table_id": "tblA"}}
+
+        collector.list_fields = lambda table_cfg: [{"field_name": name, "type": 1} for name in collector.DEFAULT_FIELDS.values()]
+        collector.get_record = lambda table_cfg, record_id: {
+            "record_id": record_id,
+            "fields": {"作品链接": "https://www.bilibili.com/video/BV1xx411c7mD/"},
+        }
+
+        def fake_process(record, table_cfg, field_types, transcribe=True):
+            captured.append(transcribe)
+            stop_event.set()
+            return "transcribed"
+
+        collector.process_record = fake_process
+
+        worker = threading.Thread(target=collector.webhook_worker, args=(cfg, jobs, stop_event), daemon=True)
+        worker.start()
+        jobs.join()
+        stop_event.set()
+        worker.join(timeout=2)
+
+        self.assertEqual(captured, [True])
+
+    def test_should_trigger_login_gate_for_login_statuses(self):
+        collector = load_collector()
+
+        self.assertTrue(collector.should_trigger_login_gate("需登录"))
+        self.assertTrue(collector.should_trigger_login_gate("需Cookie"))
+        self.assertFalse(collector.should_trigger_login_gate("网络异常"))
+
+    def test_login_gate_cooldown_allows_one_open_per_window(self):
+        collector = load_collector()
+        state = {}
+
+        self.assertTrue(collector.login_gate_cooldown_allows("抖音", state, cooldown=300, now=1000.0))
+        self.assertFalse(collector.login_gate_cooldown_allows("抖音", state, cooldown=300, now=1100.0))
+        self.assertTrue(collector.login_gate_cooldown_allows("抖音", state, cooldown=300, now=1301.0))
+
+    def test_login_gate_defaults_are_not_high_frequency(self):
+        collector = load_collector()
+
+        gate = collector.login_gate_config({})
+
+        self.assertGreaterEqual(gate["retry_interval"], 180)
+        self.assertLessEqual(gate["max_retry_attempts"], 10)
+
+    def test_health_config_defaults_are_low_frequency(self):
+        collector = load_collector()
+
+        health = collector.health_config({})
+
+        self.assertTrue(health["enabled"])
+        self.assertGreaterEqual(health["interval"], 300)
+        self.assertEqual(health["listener_label"], "com.chen.content-link-collector.event-listener")
+
+    def test_table_health_summary_counts_waiting_login_and_blank_rows(self):
+        collector = load_collector()
+        cfg = {"feishu": {"table_id": "tblA"}, "fields": collector.DEFAULT_FIELDS}
+
+        collector.discover_feishu_table_ids = lambda cfg: ["tblA"]
+        collector.list_records = lambda table_cfg: [
+            {"record_id": "rec1", "fields": {"作品链接": "https://www.douyin.com/video/1", "抓取状态": "成功"}},
+            {"record_id": "rec2", "fields": {"作品链接": "https://www.douyin.com/video/2", "抓取状态": "等待登录"}},
+            {"record_id": "rec3", "fields": {"作品链接": "https://www.xiaohongshu.com/explore/abc"}},
+            {"record_id": "rec4", "fields": {}},
+        ]
+
+        summary = collector.table_health_summary(cfg)
+
+        self.assertEqual(summary["tables"][0]["table_id"], "tblA")
+        self.assertEqual(summary["tables"][0]["status_counts"]["成功"], 1)
+        self.assertEqual(summary["tables"][0]["status_counts"]["等待登录"], 1)
+        self.assertEqual(summary["tables"][0]["blank_link_rows"], 1)
+        self.assertEqual(summary["waiting_login"], [{"table_id": "tblA", "record_id": "rec2", "platform": "抖音"}])
+        self.assertEqual(summary["blank_jobs"], [("tblA", "rec3")])
+
+    def test_health_check_repairs_listener_and_browser(self):
+        collector = load_collector()
+        calls = []
+        cfg = {
+            "feishu": {"table_id": "tblA"},
+            "fields": collector.DEFAULT_FIELDS,
+            "browser_fallback": {"enabled": True},
+            "health": {"listener_label": "listener.test"},
+        }
+
+        collector.launchctl_service_running = lambda label: False
+        collector.launchctl_kickstart = lambda label: calls.append(("kickstart", label)) or True
+        collector.browser_fallback_config = lambda cfg: {"enabled": True}
+        collector.cdp_browser_available = lambda fallback_cfg: False
+        collector.launch_cdp_browser = lambda fallback_cfg, start_url="about:blank": calls.append(("browser", start_url))
+        collector.table_health_summary = lambda cfg: {"tables": [], "waiting_login": [], "blank_jobs": []}
+
+        result = collector.run_health_check(cfg, repair=True)
+
+        self.assertEqual(result["listener"]["status"], "restarted")
+        self.assertEqual(result["browser"]["status"], "started")
+        self.assertIn(("kickstart", "listener.test"), calls)
+        self.assertIn(("browser", "https://www.douyin.com/"), calls)
+
     def test_should_process_blank_record_only_for_new_link_rows(self):
         collector = load_collector()
         cfg = {"fields": collector.DEFAULT_FIELDS}
@@ -172,6 +383,43 @@ class WebhookHelperTests(unittest.TestCase):
         collector = load_collector()
         cfg = {"fields": collector.DEFAULT_FIELDS}
 
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "抓取状态": "需登录",
+                    }
+                },
+                cfg,
+            )
+        )
+        self.assertFalse(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "抓取状态": "等待登录",
+                        "抓取时间": "2026-06-27 10:00:00",
+                    }
+                },
+                cfg,
+                now=collector.dt.datetime(2026, 6, 27, 10, 1, 0),
+            )
+        )
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "抓取状态": "等待登录",
+                        "抓取时间": "2026-06-27 10:00:00",
+                    }
+                },
+                cfg,
+                now=collector.dt.datetime(2026, 6, 27, 10, 4, 0),
+            )
+        )
         self.assertTrue(
             collector.should_process_blank_record(
                 {
@@ -203,6 +451,41 @@ class WebhookHelperTests(unittest.TestCase):
                         "作品链接": "https://www.douyin.com/video/123456789",
                         "作品标题": "已有标题",
                         "抓取状态": "无音频",
+                    }
+                },
+                cfg,
+            )
+        )
+
+    def test_should_process_rows_with_browser_placeholder_title(self):
+        collector = load_collector()
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "作品标题": "PC Tab",
+                        "抓取状态": "成功",
+                    }
+                },
+                cfg,
+            )
+        )
+
+    def test_should_process_rows_with_old_browser_launch_error(self):
+        collector = load_collector()
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
+                        "文案": "{'cache_switch': False, 'enable': 1}",
+                        "抓取状态": "待人工确认",
+                        "错误信息": "BrowserType.launch_persistent_context: Target page closed",
                     }
                 },
                 cfg,
@@ -248,11 +531,11 @@ class WebhookHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "腾讯云本地音频上传限制"):
                 collector.tencent_transcribe_file({"tencent_asr": {}}, audio)
 
-    def test_should_transcribe_record_only_after_metadata_sync(self):
+    def test_should_transcribe_record_for_new_and_pending_rows(self):
         collector = load_collector()
         cfg = {"fields": collector.DEFAULT_FIELDS}
 
-        self.assertFalse(
+        self.assertTrue(
             collector.should_transcribe_record(
                 {"fields": {"作品链接": "https://www.douyin.com/video/123456789"}},
                 cfg,
@@ -283,6 +566,2755 @@ class WebhookHelperTests(unittest.TestCase):
             ),
             "https://p3-sign.douyinpic.com/full-cover.webp",
         )
+
+    def test_desktop_db_creates_default_and_custom_tables(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+
+            tables = collector.desktop_list_tables(db)
+            self.assertEqual(tables[0]["name"], "默认采集表")
+
+            custom = collector.desktop_create_table(db, "抖音选题库", "抖音")
+
+            self.assertEqual(custom["name"], "抖音选题库")
+            self.assertEqual(custom["default_platform"], "抖音")
+
+            renamed = collector.desktop_rename_table(db, custom["id"], "改名后的表")
+
+            self.assertEqual(renamed["name"], "改名后的表")
+
+    def test_desktop_table_names_are_unique_for_blank_create_and_rename(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+
+            first = collector.desktop_create_table(db, "", "抖音")
+            second = collector.desktop_create_table(db, "", "抖音")
+
+            self.assertNotEqual(first["name"], second["name"])
+            with self.assertRaises(ValueError):
+                collector.desktop_rename_table(db, second["id"], first["name"])
+
+    def test_desktop_db_saves_and_lists_items(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/1",
+                    "source_type": "single",
+                    "title": "标题",
+                    "caption": "逐字稿",
+                    "cover_url": "https://example.com/cover.jpg",
+                    "duration": "01:00",
+                    "likes": 1,
+                    "comments": 2,
+                    "shares": 3,
+                    "published_at": "2026年01月01日00时00分00秒",
+                    "status": "成功",
+                    "error": "",
+                    "raw_metadata_json": "{}",
+                },
+            )
+            items = collector.desktop_list_items(db, table["id"])
+
+            self.assertEqual(items[0]["id"], saved["id"])
+            self.assertEqual(items[0]["title"], "标题")
+
+    def test_desktop_save_item_preserves_existing_data_when_retry_has_blanks(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/keep-me",
+                    "source_type": "profile",
+                    "title": "主页已发现标题",
+                    "cover_url": "https://example.com/cover.jpg",
+                    "duration": "01:00",
+                    "likes": 7,
+                    "status": "已发现链接",
+                    "raw_metadata_json": '{"ok": true}',
+                },
+            )
+
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/keep-me",
+                    "source_type": "profile",
+                    "title": "",
+                    "cover_url": "",
+                    "duration": "",
+                    "likes": None,
+                    "status": "等待登录",
+                    "error": "临时失败",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            self.assertEqual(saved["title"], "主页已发现标题")
+            self.assertEqual(saved["cover_url"], "https://example.com/cover.jpg")
+            self.assertEqual(saved["duration"], "01:00")
+            self.assertEqual(saved["likes"], 7)
+            self.assertEqual(saved["status"], "等待登录")
+            self.assertEqual(saved["error"], "临时失败")
+
+    def test_desktop_update_item_edits_allowed_fields(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/edit-me",
+                    "source_type": "single",
+                    "title": "旧标题",
+                    "likes": 1,
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            updated = collector.desktop_update_item(
+                db,
+                saved["id"],
+                {"title": "新标题", "likes": "12", "source_url": "https://evil.example/ignored"},
+            )
+
+            self.assertEqual(updated["title"], "新标题")
+            self.assertEqual(updated["likes"], 12)
+            self.assertEqual(updated["source_url"], "https://www.douyin.com/video/edit-me")
+
+    def test_desktop_update_item_accepts_daily_fields(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/daily-me",
+                    "source_type": "single",
+                    "title": "日报素材",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            updated = collector.desktop_update_item(
+                db,
+                saved["id"],
+                {
+                    "daily_selected": True,
+                    "daily_date": "2026-07-09",
+                    "daily_sort": "42",
+                    "max_daily_card": "口喷卡片",
+                    "max_feedback": "可讲",
+                },
+            )
+
+            self.assertEqual(updated["daily_selected"], 1)
+            self.assertEqual(updated["daily_date"], "2026-07-09")
+            self.assertEqual(updated["daily_sort"], 42)
+            self.assertEqual(updated["max_daily_card"], "口喷卡片")
+            self.assertEqual(updated["max_feedback"], "可讲")
+
+    def test_desktop_daily_payload_includes_history_dates(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            first = collector.desktop_save_item(
+                db,
+                table["id"],
+                {"platform": "抖音", "source_url": "https://a.example/1", "source_type": "single", "title": "昨天", "raw_metadata_json": "{}"},
+            )
+            second = collector.desktop_save_item(
+                db,
+                table["id"],
+                {"platform": "抖音", "source_url": "https://a.example/2", "source_type": "single", "title": "今天", "raw_metadata_json": "{}"},
+            )
+            collector.desktop_update_item(db, first["id"], {"daily_selected": True, "daily_date": "2026-07-08", "daily_sort": 1})
+            collector.desktop_update_item(db, second["id"], {"daily_selected": True, "daily_date": "2026-07-09", "daily_sort": 1})
+
+            payload = collector.desktop_daily_payload(db, "")
+
+            self.assertEqual(payload["date"], "2026-07-09")
+            self.assertEqual([d["date"] for d in payload["dates"]], ["2026-07-09", "2026-07-08"])
+
+    def test_desktop_save_cover_file_writes_file(self):
+        collector = load_collector()
+        original_fetch_binary = collector.fetch_binary
+        try:
+            collector.fetch_binary = lambda url, cfg, platform: (b"image-bytes", "image/jpeg", ".jpg")
+            with tempfile.TemporaryDirectory() as tmp:
+                result = collector.desktop_save_cover_file(
+                    "https://example.com/cover.jpg",
+                    {},
+                    "抖音",
+                    Path(tmp),
+                )
+
+                saved = Path(result["path"])
+                self.assertTrue(saved.exists())
+                self.assertEqual(saved.read_bytes(), b"image-bytes")
+                self.assertEqual(result["content_type"], "image/jpeg")
+        finally:
+            collector.fetch_binary = original_fetch_binary
+
+    def test_desktop_save_video_file_uses_saved_media_url(self):
+        collector = load_collector()
+        original_download = getattr(collector, "download_media_url_to_file", None)
+        try:
+            calls = []
+
+            def fake_download(url, cfg, platform, target):
+                calls.append((url, platform, target.name))
+                target.write_bytes(b"video-bytes")
+                return {"content_type": "video/mp4", "bytes": len(b"video-bytes")}
+
+            collector.download_media_url_to_file = fake_download
+            with tempfile.TemporaryDirectory() as tmp:
+                db = Path(tmp) / "desktop.sqlite3"
+                downloads = Path(tmp) / "downloads"
+                collector.desktop_db_init(db)
+                table = collector.desktop_list_tables(db)[0]
+                saved = collector.desktop_save_item(
+                    db,
+                    table["id"],
+                    {
+                        "platform": "抖音",
+                        "source_url": "https://www.douyin.com/video/1",
+                        "source_type": "single",
+                        "title": "测试/视频:无水印",
+                        "status": "成功",
+                        "raw_metadata_json": json.dumps(
+                            {
+                                "platform": "抖音",
+                                "title": "测试/视频:无水印",
+                                "media_url": "https://v5.365yg.com/a?mime_type=video_mp4",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                )
+
+                result = collector.desktop_save_video_file(db, saved["id"], {}, downloads)
+
+                self.assertEqual(result["bytes"], len(b"video-bytes"))
+                self.assertTrue(Path(result["path"]).exists())
+                self.assertEqual(Path(result["path"]).read_bytes(), b"video-bytes")
+                self.assertEqual(calls[0][0], "https://v5.365yg.com/a?mime_type=video_mp4")
+                self.assertIn("测试_视频_无水印", Path(result["path"]).name)
+        finally:
+            if original_download is not None:
+                collector.download_media_url_to_file = original_download
+
+    def test_desktop_save_video_file_falls_back_to_ytdlp_for_youtube(self):
+        collector = load_collector()
+        original_extract = collector.extract_from_page
+        original_download_ytdlp = collector.download_media_with_ytdlp
+        try:
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "YouTube",
+                "content_type": "video",
+                "title": "YouTube视频",
+                "media_url": "",
+            }
+
+            def fake_ytdlp(url, cfg):
+                tmp_dir = Path(tempfile.mkdtemp(prefix="video-download-test-"))
+                path = tmp_dir / "media.mp4"
+                path.write_bytes(b"yt-video")
+                return path
+
+            collector.download_media_with_ytdlp = fake_ytdlp
+            with tempfile.TemporaryDirectory() as tmp:
+                db = Path(tmp) / "desktop.sqlite3"
+                downloads = Path(tmp) / "downloads"
+                collector.desktop_db_init(db)
+                table = collector.desktop_list_tables(db)[0]
+                saved = collector.desktop_save_item(
+                    db,
+                    table["id"],
+                    {
+                        "platform": "YouTube",
+                        "source_url": "https://www.youtube.com/watch?v=abc123xyz90",
+                        "source_type": "single",
+                        "title": "YouTube视频",
+                        "status": "成功",
+                        "raw_metadata_json": "{}",
+                    },
+                )
+
+                result = collector.desktop_save_video_file(db, saved["id"], {}, downloads)
+
+                self.assertEqual(Path(result["path"]).read_bytes(), b"yt-video")
+                self.assertEqual(result["method"], "yt-dlp")
+        finally:
+            collector.extract_from_page = original_extract
+            collector.download_media_with_ytdlp = original_download_ytdlp
+
+    def test_desktop_save_video_file_refreshes_expired_media_url(self):
+        collector = load_collector()
+        original_download = getattr(collector, "download_media_url_to_file", None)
+        original_extract = collector.extract_from_page
+        try:
+            calls = []
+
+            def fake_download(url, cfg, platform, target):
+                calls.append(url)
+                if "expired" in url:
+                    raise RuntimeError("HTTP Error 403: Forbidden")
+                target.write_bytes(b"fresh-video")
+                return {"content_type": "video/mp4", "bytes": len(b"fresh-video")}
+
+            collector.download_media_url_to_file = fake_download
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "抖音",
+                "content_type": "video",
+                "title": "刷新后标题",
+                "media_url": "https://v5.365yg.com/fresh?mime_type=video_mp4",
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                db = Path(tmp) / "desktop.sqlite3"
+                downloads = Path(tmp) / "downloads"
+                collector.desktop_db_init(db)
+                table = collector.desktop_list_tables(db)[0]
+                saved = collector.desktop_save_item(
+                    db,
+                    table["id"],
+                    {
+                        "platform": "抖音",
+                        "source_url": "https://www.douyin.com/video/1",
+                        "source_type": "single",
+                        "title": "旧标题",
+                        "status": "成功",
+                        "raw_metadata_json": json.dumps(
+                            {"platform": "抖音", "title": "旧标题", "media_url": "https://v5.365yg.com/expired?mime_type=video_mp4"},
+                            ensure_ascii=False,
+                        ),
+                    },
+                )
+
+                result = collector.desktop_save_video_file(db, saved["id"], {}, downloads)
+
+                self.assertEqual(calls, [
+                    "https://v5.365yg.com/expired?mime_type=video_mp4",
+                    "https://v5.365yg.com/fresh?mime_type=video_mp4",
+                ])
+                self.assertEqual(Path(result["path"]).read_bytes(), b"fresh-video")
+                self.assertEqual(result["method"], "media_url")
+        finally:
+            if original_download is not None:
+                collector.download_media_url_to_file = original_download
+            collector.extract_from_page = original_extract
+
+    def test_desktop_queue_add_and_process_pending_mobile_tasks(self):
+        collector = load_collector()
+        original_scrape = collector.desktop_scrape_single_url
+        try:
+            processed = []
+
+            def fake_scrape(db_path, table_id, url, cfg, platform_hint="", source_type="single", transcribe=True):
+                processed.append((url, platform_hint, source_type, transcribe))
+                return collector.desktop_save_item(
+                    db_path,
+                    table_id,
+                    {
+                        "platform": platform_hint or "抖音",
+                        "source_url": url,
+                        "source_type": source_type,
+                        "title": "队列完成",
+                        "status": "成功",
+                        "raw_metadata_json": "{}",
+                    },
+                )
+
+            collector.desktop_scrape_single_url = fake_scrape
+            with tempfile.TemporaryDirectory() as tmp:
+                db = Path(tmp) / "desktop.sqlite3"
+                collector.desktop_db_init(db)
+                table = collector.desktop_list_tables(db)[0]
+
+                added = collector.desktop_queue_add_urls(db, table["id"], ["https://www.douyin.com/video/1"], "抖音")
+                self.assertEqual(added["count"], 1)
+                self.assertEqual(collector.desktop_queue_pending_items(db)[0]["status"], "待采集")
+
+                result = collector.desktop_queue_process_once(db, {}, limit=5)
+
+                self.assertEqual(result["count"], 1)
+                self.assertEqual(result["remaining"], 0)
+                self.assertEqual(processed, [("https://www.douyin.com/video/1", "抖音", "single", True)])
+                self.assertEqual(collector.desktop_list_items(db, table["id"])[0]["title"], "队列完成")
+        finally:
+            collector.desktop_scrape_single_url = original_scrape
+
+    def test_desktop_engine_status_reports_pending_queue(self):
+        collector = load_collector()
+        original_cdp = collector.cdp_browser_available
+        original_launchctl = collector.launchctl_label_running
+        original_pmset = collector.pmset_power_summary
+        try:
+            collector.cdp_browser_available = lambda cfg: True
+            collector.launchctl_label_running = lambda label: True
+            collector.pmset_power_summary = lambda: {"source": "AC Power"}
+            with tempfile.TemporaryDirectory() as tmp:
+                db = Path(tmp) / "desktop.sqlite3"
+                collector.desktop_db_init(db)
+                table = collector.desktop_list_tables(db)[0]
+                collector.desktop_queue_add_urls(db, table["id"], ["https://www.douyin.com/video/1"], "抖音")
+
+                status = collector.desktop_engine_status(db, {"browser_fallback": {"enabled": True}})
+
+                self.assertEqual(status["status"], "有待采集任务")
+                self.assertEqual(status["pending_count"], 1)
+                self.assertEqual(status["cdp_browser"], "运行中")
+                self.assertEqual(status["power_source"], "AC Power")
+        finally:
+            collector.cdp_browser_available = original_cdp
+            collector.launchctl_label_running = original_launchctl
+            collector.pmset_power_summary = original_pmset
+
+    def test_desktop_export_formats_include_saved_items(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/export-me",
+                    "source_type": "single",
+                    "title": "导出标题",
+                    "caption": "导出逐字稿",
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            csv_data = collector.desktop_export_bytes(db, table["id"], "csv")[0].decode("utf-8")
+            md_data = collector.desktop_export_bytes(db, table["id"], "markdown")[0].decode("utf-8")
+            json_data = collector.desktop_export_bytes(db, table["id"], "json")[0].decode("utf-8")
+
+            self.assertIn("导出标题", csv_data)
+            self.assertIn("### 文案/逐字稿", md_data)
+            self.assertIn('"title": "导出标题"', json_data)
+
+    def test_desktop_save_export_file_writes_selected_path(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            target = Path(tmp) / "导出结果"
+
+            result = collector.desktop_save_export_file(db, table["id"], "markdown", target)
+
+            saved = Path(result["path"])
+            self.assertEqual(saved.suffix, ".md")
+            self.assertTrue(saved.exists())
+            self.assertIn("CHEN 内容采集表", saved.read_text(encoding="utf-8"))
+
+    def test_douyin_profile_entries_extract_unique_video_links(self):
+        collector = load_collector()
+
+        links = collector.douyin_profile_entries_to_links(
+            [
+                {"href": "https://www.douyin.com/video/741147029037124910", "text": "第1集 标题"},
+                {"href": "https://www.douyin.com/?modal_id=741147029037124910", "text": "重复链接"},
+                {"href": "/video/741147029037124911", "text": "第2集 标题"},
+                {"href": "https://www.douyin.com/share/video/741147029037124912?aweme_id=741147029037124912", "text": ""},
+                {"href": "https://www.douyin.com/user/MS4wLjABAAAA", "text": "主页"},
+            ],
+            "https://www.douyin.com/user/MS4wLjABAAAA",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://www.douyin.com/video/741147029037124910",
+                "https://www.douyin.com/video/741147029037124911",
+                "https://www.douyin.com/video/741147029037124912",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "第1集 标题")
+
+    def test_xiaohongshu_profile_entries_extract_unique_note_links(self):
+        collector = load_collector()
+
+        links = collector.xiaohongshu_profile_entries_to_links(
+            [
+                {"href": "https://www.xiaohongshu.com/explore/665aabbccddeeff001122334", "text": "小红书视频笔记 标题"},
+                {"href": "/explore/665aabbccddeeff001122334?xsec_token=abc", "text": "重复笔记"},
+                {"href": "https://www.xiaohongshu.com/discovery/item/665aabbccddeeff001122335", "text": "图文笔记"},
+                {"href": "https://www.xiaohongshu.com/user/profile/abc", "text": "主页"},
+            ],
+            "https://www.xiaohongshu.com/user/profile/abc",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://www.xiaohongshu.com/explore/665aabbccddeeff001122334",
+                "https://www.xiaohongshu.com/explore/665aabbccddeeff001122335",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "小红书视频笔记 标题")
+
+    def test_bilibili_profile_entries_extract_unique_video_links(self):
+        collector = load_collector()
+
+        links = collector.bilibili_profile_entries_to_links(
+            [
+                {"href": "https://www.bilibili.com/video/BV1xx411c7mD/", "text": "B站视频标题"},
+                {"href": "/video/BV1xx411c7mD/?spm_id_from=333", "text": "重复"},
+                {"href": "https://www.bilibili.com/video/av123456", "text": "av 视频"},
+                {"href": "https://space.bilibili.com/123/video", "text": "主页"},
+            ],
+            "https://space.bilibili.com/123/video",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://www.bilibili.com/video/BV1xx411c7mD",
+                "https://www.bilibili.com/video/av123456",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "B站视频标题")
+
+    def test_shipinhao_profile_entries_extract_unique_visible_work_links(self):
+        collector = load_collector()
+
+        links = collector.shipinhao_profile_entries_to_links(
+            [
+                {
+                    "href": "https://channels.weixin.qq.com/platform/post/1234567890?scene=home",
+                    "text": "视频号作品标题",
+                },
+                {
+                    "href": "/platform/post/1234567890?scene=home",
+                    "text": "重复作品",
+                },
+                {
+                    "href": "https://channels.weixin.qq.com/web/pages/feed?exportkey=abc&feed_id=feed123",
+                    "text": "分享页作品",
+                    "cover_url": "//res.wx.qq.com/cover.jpg",
+                },
+                {
+                    "href": "https://channels.weixin.qq.com/platform/profile/abc",
+                    "text": "主页",
+                },
+                {
+                    "href": "https://support.weixin.qq.com/",
+                    "text": "帮助",
+                },
+            ],
+            "https://channels.weixin.qq.com/platform/profile/abc",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://channels.weixin.qq.com/platform/post/1234567890?scene=home",
+                "https://channels.weixin.qq.com/web/pages/feed?exportkey=abc&feed_id=feed123",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "视频号作品标题")
+        self.assertEqual(links[1]["cover_url"], "https://res.wx.qq.com/cover.jpg")
+
+    def test_youtube_profile_entries_extract_unique_video_and_shorts_links(self):
+        collector = load_collector()
+
+        links = collector.youtube_profile_entries_to_links(
+            [
+                {"href": "https://www.youtube.com/watch?v=abc123xyz90&list=foo", "text": "YouTube 视频标题"},
+                {"href": "/watch?v=abc123xyz90", "text": "重复"},
+                {"href": "https://www.youtube.com/shorts/shorts12345", "text": "Shorts 标题"},
+                {"href": "https://www.youtube.com/@creator", "text": "主页"},
+            ],
+            "https://www.youtube.com/@creator/videos",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                "https://www.youtube.com/shorts/shorts12345",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "YouTube 视频标题")
+
+    def test_instagram_profile_entries_extract_unique_post_and_reel_links(self):
+        collector = load_collector()
+
+        links = collector.instagram_profile_entries_to_links(
+            [
+                {"href": "https://www.instagram.com/reel/ABCdef123/?utm_source=ig_web_copy_link", "text": "Reel 标题"},
+                {"href": "/reel/ABCdef123/", "text": "重复"},
+                {"href": "https://www.instagram.com/p/POSTid456/", "text": "图文帖"},
+                {"href": "https://www.instagram.com/stories/user/123", "text": "快拍"},
+            ],
+            "https://www.instagram.com/creator/",
+        )
+
+        self.assertEqual(
+            [item["url"] for item in links],
+            [
+                "https://www.instagram.com/reel/ABCdef123/",
+                "https://www.instagram.com/p/POSTid456/",
+            ],
+        )
+        self.assertEqual(links[0]["title"], "Reel 标题")
+
+    def test_desktop_save_profile_candidate_does_not_deep_scrape(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+
+            saved = collector.desktop_save_profile_candidate(
+                db,
+                table["id"],
+                {
+                    "url": "https://www.douyin.com/video/741147029037124910",
+                    "title": "主页预览标题",
+                    "cover_url": "https://example.com/cover.jpg",
+                },
+                "https://www.douyin.com/user/MS4wLjABAAAA",
+            )
+
+            self.assertEqual(saved["status"], "候选")
+            self.assertEqual(saved["title"], "主页预览标题")
+            self.assertEqual(saved["duration"], "")
+            self.assertIn("勾选", saved["error"])
+
+    def test_desktop_save_profile_candidate_uses_target_platform(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+
+            saved = collector.desktop_save_profile_candidate(
+                db,
+                table["id"],
+                {"url": "https://www.bilibili.com/video/BV1xx411c7mD", "title": "B站候选"},
+                "https://space.bilibili.com/123/video",
+                platform="B站",
+            )
+
+            self.assertEqual(saved["platform"], "B站")
+            self.assertEqual(saved["status"], "候选")
+
+    def test_desktop_profile_session_accepts_added_platforms_without_starting_worker(self):
+        collector = load_collector()
+        started = []
+
+        class FakeThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                started.append((self.target.__name__, self.args[5]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            original_thread = collector.threading.Thread
+            xhs = bz = shipin = yt = ig = None
+            try:
+                collector.threading.Thread = FakeThread
+                xhs = collector.desktop_start_profile_session(
+                    db,
+                    table["id"],
+                    "https://www.xiaohongshu.com/user/profile/abc",
+                    {},
+                    "小红书",
+                )
+                bz = collector.desktop_start_profile_session(
+                    db,
+                    table["id"],
+                    "https://space.bilibili.com/123/video",
+                    {},
+                    "B站",
+                )
+                shipin = collector.desktop_start_profile_session(
+                    db,
+                    table["id"],
+                    "https://channels.weixin.qq.com/platform/profile/abc",
+                    {},
+                    "视频号",
+                )
+                yt = collector.desktop_start_profile_session(
+                    db,
+                    table["id"],
+                    "https://www.youtube.com/@creator/videos",
+                    {},
+                    "YouTube",
+                )
+                ig = collector.desktop_start_profile_session(
+                    db,
+                    table["id"],
+                    "https://www.instagram.com/creator/",
+                    {},
+                    "Instagram",
+                )
+            finally:
+                collector.threading.Thread = original_thread
+                for session in (xhs, bz, shipin, yt, ig):
+                    if session:
+                        collector.DESKTOP_PROFILE_SESSIONS.pop(session["session_id"], None)
+
+            self.assertEqual([item[1] for item in started], ["小红书", "B站", "视频号", "YouTube", "Instagram"])
+
+    def test_desktop_app_html_enables_all_added_profile_modes(self):
+        collector = load_collector()
+
+        self.assertNotIn("主页批量任务（规划中）", collector.DESKTOP_APP_HTML)
+        self.assertNotIn("第一版主页批量采集先支持抖音主页", collector.DESKTOP_APP_HTML)
+        self.assertIn("小红书主页候选预览", collector.DESKTOP_APP_HTML)
+        self.assertIn("B站主页候选预览", collector.DESKTOP_APP_HTML)
+        self.assertIn("视频号主页候选预览", collector.DESKTOP_APP_HTML)
+        self.assertIn("YouTube频道候选预览", collector.DESKTOP_APP_HTML)
+        self.assertIn("Instagram主页候选预览", collector.DESKTOP_APP_HTML)
+
+    def test_desktop_app_selection_tools_apply_to_all_current_rows(self):
+        collector = load_collector()
+
+        self.assertIn("全选当前", collector.DESKTOP_APP_HTML)
+        self.assertNotIn("全选候选", collector.DESKTOP_APP_HTML)
+        self.assertIn("function selectableItems()", collector.DESKTOP_APP_HTML)
+        self.assertIn("state.items.filter(i=>i.source_url", collector.DESKTOP_APP_HTML)
+        self.assertIn("row-selected", collector.DESKTOP_APP_HTML)
+        self.assertIn("setTableFeedback", collector.DESKTOP_APP_HTML)
+
+    def test_desktop_app_table_tools_match_bitable_workflow(self):
+        collector = load_collector()
+
+        for label in ("字段配置", "筛选", "排序", "行高", "重置视图"):
+            self.assertIn(label, collector.DESKTOP_APP_HTML)
+        self.assertIn("function visibleColumns()", collector.DESKTOP_APP_HTML)
+        self.assertIn("function filteredItems()", collector.DESKTOP_APP_HTML)
+        self.assertIn("function sortedItems()", collector.DESKTOP_APP_HTML)
+        self.assertIn("function setRowDensity", collector.DESKTOP_APP_HTML)
+        self.assertIn("function saveTablePrefs()", collector.DESKTOP_APP_HTML)
+        self.assertIn("localStorage.setItem('chen.tablePrefs'", collector.DESKTOP_APP_HTML)
+        self.assertIn("selected-count", collector.DESKTOP_APP_HTML)
+        self.assertIn("table-toolbar-panel", collector.DESKTOP_APP_HTML)
+
+    def test_desktop_app_daily_fields_wrap_in_bitable_cells(self):
+        collector = load_collector()
+
+        self.assertIn("const multilineFields=new Set", collector.DESKTOP_APP_HTML)
+        for field in ("caption", "error", "title", "max_daily_card", "max_feedback", "daily_date"):
+            self.assertIn(f"'{field}'", collector.DESKTOP_APP_HTML)
+        self.assertIn("white-space:pre-wrap", collector.DESKTOP_APP_HTML)
+        self.assertIn("overflow-wrap:anywhere", collector.DESKTOP_APP_HTML)
+        self.assertIn("word-break:break-word", collector.DESKTOP_APP_HTML)
+        self.assertIn("function tableWidthClass()", collector.DESKTOP_APP_HTML)
+        self.assertIn("table-fit-panel", collector.DESKTOP_APP_HTML)
+        self.assertIn("visibleColumns().length<=4", collector.DESKTOP_APP_HTML)
+
+    def test_desktop_app_table_toolbar_has_clear_bitable_layout(self):
+        collector = load_collector()
+
+        self.assertIn("results-panel", collector.DESKTOP_APP_HTML)
+        self.assertIn("table-shell-head", collector.DESKTOP_APP_HTML)
+        self.assertIn("table-primary-actions", collector.DESKTOP_APP_HTML)
+        self.assertIn("bitable-toolbar", collector.DESKTOP_APP_HTML)
+        self.assertIn("toolbar-group", collector.DESKTOP_APP_HTML)
+        self.assertIn("toolbar-spacer", collector.DESKTOP_APP_HTML)
+
+    def test_desktop_app_restores_daily_entry_points(self):
+        collector = load_collector()
+
+        self.assertIn("打开今日日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("MAX口喷日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("daily-hero-btn", collector.DESKTOP_APP_HTML)
+        self.assertIn("日报日期", collector.DESKTOP_APP_HTML)
+        self.assertIn("录入日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("删除日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("已录入", collector.DESKTOP_APP_HTML)
+        self.assertIn("function openDailyPage()", collector.DESKTOP_APP_HTML)
+        self.assertIn("window.location.href=dailyPageUrl()", collector.DESKTOP_APP_HTML)
+        self.assertIn("function toggleDaily(id,force)", collector.DESKTOP_APP_HTML)
+        self.assertIn("function dailyDateHtml(i)", collector.DESKTOP_APP_HTML)
+        self.assertIn("function dailyActionHtml(i)", collector.DESKTOP_APP_HTML)
+        self.assertIn("打开登录浏览器", collector.DESKTOP_APP_HTML)
+        self.assertIn("/api/browser/login", collector.DESKTOP_APP_HTML)
+        self.assertIn("daily_selected", collector.DESKTOP_APP_HTML)
+        self.assertIn("daily_date", collector.DESKTOP_APP_HTML)
+        self.assertIn("/daily?date=", collector.DESKTOP_APP_HTML)
+        self.assertIn("返回采集助手", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("日报时间轴", collector.DESKTOP_DAILY_HTML)
+        for label in ("工作台", "视频专注", "文稿阅读", "表格总览", "调整空间"):
+            self.assertIn(label, collector.DESKTOP_DAILY_HTML)
+        self.assertIn("dates=data.dates", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("toggleTimeline()", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("timelinePopover", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("function setDailyView(view)", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("function toggleTool(tool)", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("function setDensity(value)", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("dailyDrift", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("<aside class=\"panel side\"><h2>当天素材</h2>", collector.DESKTOP_DAILY_HTML)
+        self.assertNotIn("onclick=\"location.href='/daily'\">日报时间轴", collector.DESKTOP_DAILY_HTML)
+
+    def test_desktop_app_home_hero_keeps_daily_entry_button(self):
+        collector = load_collector()
+
+        html = collector.DESKTOP_APP_HTML
+        hero_start = html.index("<section class=\"hero\">")
+        hero_end = html.index("<section class=\"platforms\"", hero_start)
+        hero_html = html[hero_start:hero_end]
+        self.assertIn("MAX口喷日报", hero_html)
+        self.assertIn("daily-hero-btn", hero_html)
+        self.assertIn("onclick=\"openDailyPage()\"", hero_html)
+        self.assertIn(".daily-hero-btn{min-height:54px;padding:0 24px;border-radius:14px;background:linear-gradient(135deg,#ffd36b,var(--orange))", html)
+        self.assertNotIn(".daily-hero-btn{min-height:54px;padding:0 24px;border-radius:14px;background:linear-gradient(135deg,#45a9ff,#7cc7ff)", html)
+
+    def test_desktop_app_daily_action_is_stateful(self):
+        collector = load_collector()
+
+        html = collector.DESKTOP_APP_HTML
+        self.assertIn("function dailyActionHtml(i)", html)
+        self.assertIn("Number(i.daily_selected||0)", html)
+        self.assertIn("toggleDaily('${id}',1)", html)
+        self.assertIn("toggleDaily('${id}',0)", html)
+        self.assertIn("已录入 ${date}", html)
+        self.assertIn("daily_date:next?todayText():''", html)
+        self.assertIn("daily_sort:next?Date.now():0", html)
+        self.assertNotIn("const dailyLabel=dailyOn?'移出今日日报':'加入今日日报'", html)
+
+    def test_desktop_engine_status_tracks_all_platforms(self):
+        collector = load_collector()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "collector.db"
+            table = collector.desktop_create_table(db_path, "平台状态测试", "抖音")
+            collector.desktop_save_item(
+                db_path,
+                table["id"],
+                {
+                    "platform": "小红书",
+                    "source_url": "https://www.xiaohongshu.com/explore/abc",
+                    "source_type": "single",
+                    "status": "需登录",
+                },
+            )
+            collector.desktop_save_item(
+                db_path,
+                table["id"],
+                {
+                    "platform": "",
+                    "source_url": "https://www.youtube.com/watch?v=abc123",
+                    "source_type": "single",
+                    "status": "等待登录",
+                },
+            )
+            collector.cdp_browser_available = lambda cfg: False
+            collector.pmset_power_summary = lambda: {"source": "AC Power"}
+            collector.launchctl_label_running = lambda label: False
+
+            status = collector.desktop_engine_status(db_path, {"browser_fallback": {"enabled": True}})
+
+        platform_rows = {row["platform"]: row for row in status["platform_statuses"]}
+        self.assertEqual(list(platform_rows), collector.DESKTOP_ENGINE_PLATFORMS)
+        self.assertEqual(platform_rows["小红书"]["waiting_login_count"], 1)
+        self.assertEqual(platform_rows["小红书"]["status"], "需要登录")
+        self.assertEqual(platform_rows["YouTube"]["waiting_login_count"], 1)
+        self.assertEqual(platform_rows["YouTube"]["status"], "需要登录")
+        self.assertEqual(platform_rows["抖音"]["status"], "浏览器未连接")
+        self.assertEqual(platform_rows["Instagram"]["login_url"], "https://www.instagram.com/")
+
+    def test_desktop_app_engine_card_has_all_platform_controls(self):
+        collector = load_collector()
+
+        self.assertIn("engine-card compact", collector.DESKTOP_APP_HTML)
+        self.assertIn("engine-compact-summary", collector.DESKTOP_APP_HTML)
+        self.assertIn("engine-status-popover", collector.DESKTOP_APP_HTML)
+        self.assertIn("function toggleEngineStatusPanel(force)", collector.DESKTOP_APP_HTML)
+        self.assertIn("engine-platform-grid", collector.DESKTOP_APP_HTML)
+        self.assertIn("function platformStatusHtml(rows)", collector.DESKTOP_APP_HTML)
+        self.assertIn("function platformTone(row)", collector.DESKTOP_APP_HTML)
+        self.assertIn("function openLoginBrowser(platform)", collector.DESKTOP_APP_HTML)
+        for platform in collector.DESKTOP_ENGINE_PLATFORMS:
+            self.assertIn(f"打开{platform}登录浏览器", collector.DESKTOP_APP_HTML)
+            self.assertIn(f"openLoginBrowser('{platform}')", collector.DESKTOP_APP_HTML)
+
+    def test_regression_guardrail_keeps_daily_workbench_contract(self):
+        collector = load_collector()
+
+        required_daily_markers = [
+            "dailyParticleCanvas",
+            "dailyColumns",
+            "setFieldPreset",
+            "setFieldVisible",
+            "function renderTable(list)",
+            "function setFilter(k,v)",
+            "function setSort(field,dir)",
+            "function setDailyView(view)",
+            "function toggleTimeline(force)",
+            "timelinePopover",
+            "表格总览",
+            "字段配置",
+            "筛选",
+            "排序",
+            "行高",
+            "调整空间",
+            "当天素材",
+            "MAX口喷卡片",
+            "来源链接",
+            "原始文案 / 逐字稿",
+        ]
+        for marker in required_daily_markers:
+            self.assertIn(marker, collector.DESKTOP_DAILY_HTML)
+
+        for field_name in (
+            "作品链接",
+            "平台",
+            "作品标题",
+            "文案",
+            "封面图链接",
+            "时长",
+            "点赞",
+            "评论",
+            "分享",
+            "发布时间",
+            "抓取状态",
+            "日报日期",
+            "Max反馈",
+        ):
+            self.assertIn(field_name, collector.DESKTOP_DAILY_HTML)
+
+    def test_regression_guardrail_keeps_collector_table_contract(self):
+        collector = load_collector()
+
+        required_app_markers = [
+            "particleCanvas",
+            "tablePrefsVersion=4",
+            "飞书字段配置",
+            "setColumnPreset",
+            "setColumnVisible",
+            "function filteredItems()",
+            "function sortedItems()",
+            "function setRowDensity",
+            "function openDailyPage()",
+            "window.location.href=dailyPageUrl()",
+            "function toggleDaily(id,force)",
+            "function dailyActionHtml(i)",
+            "function openLoginBrowser(platform)",
+            "engine-platform-grid",
+            "function platformStatusHtml(rows)",
+            "/api/browser/login",
+            "function saveVideoFile(id)",
+            "/api/video/save",
+            "录入日报",
+            "删除日报",
+            "已录入",
+            "打开今日日报",
+            "下载视频",
+        ]
+        for marker in required_app_markers:
+            self.assertIn(marker, collector.DESKTOP_APP_HTML)
+
+        for field_name in (
+            "作品链接",
+            "平台",
+            "作品标题",
+            "文案",
+            "封面图链接",
+            "时长",
+            "点赞",
+            "评论",
+            "分享",
+            "发布时间",
+            "抓取状态",
+            "抓取时间",
+            "错误信息",
+            "MAX口喷卡片",
+            "日报日期",
+            "加入日报",
+            "日报排序",
+            "Max反馈",
+        ):
+            self.assertIn(field_name, collector.DESKTOP_APP_HTML)
+
+    def test_shipinhao_html_meta_keeps_video_and_status_details(self):
+        collector = load_collector()
+        html = """
+        <html><head>
+          <meta property="og:title" content="视频号作品标题">
+          <meta property="og:image" content="https://res.wx.qq.com/cover.jpg">
+          <meta property="og:video" content="https://finder.video.qq.com/video.mp4">
+        </head><body>
+          <script>window.__INITIAL_STATE__={"likeCount": 88, "commentCount": 6, "shareCount": 3, "duration": 92, "publishTime": 1780000000};</script>
+        </body></html>
+        """
+
+        meta = collector.extract_from_html(
+            "https://channels.weixin.qq.com/platform/post/123",
+            html,
+            "https://channels.weixin.qq.com/platform/post/123",
+            "视频号",
+        )
+
+        self.assertEqual(meta["platform"], "视频号")
+        self.assertEqual(meta["content_type"], "video")
+        self.assertEqual(meta["title"], "视频号作品标题")
+        self.assertEqual(meta["cover_url"], "https://res.wx.qq.com/cover.jpg")
+        self.assertEqual(meta["media_url"], "https://finder.video.qq.com/video.mp4")
+        self.assertEqual(meta["duration"], "01:32")
+        self.assertEqual(meta["likes"], 88)
+        self.assertEqual(meta["comments"], 6)
+        self.assertEqual(meta["shares"], 3)
+
+    def test_ytdlp_meta_marks_youtube_and_instagram_as_video(self):
+        collector = load_collector()
+        payload = {
+            "webpage_url": "https://www.youtube.com/watch?v=abc123xyz90",
+            "title": "YouTube 标题",
+            "thumbnail": "https://i.ytimg.com/vi/abc/hqdefault.jpg",
+            "duration": 61,
+            "like_count": 10,
+            "comment_count": 2,
+            "timestamp": 1780000000,
+            "url": "https://example.com/video.mp4",
+        }
+
+        class Result:
+            returncode = 0
+            stdout = __import__("json").dumps(payload)
+            stderr = ""
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.subprocess.run = lambda *args, **kwargs: Result()
+
+            meta = collector.extract_with_ytdlp("https://www.youtube.com/watch?v=abc123xyz90", {"yt_dlp": {"enabled": True}})
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.subprocess.run = original_run
+
+        self.assertEqual(meta["platform"], "YouTube")
+        self.assertEqual(meta["content_type"], "video")
+        self.assertEqual(meta["title"], "YouTube 标题")
+        self.assertEqual(meta["duration"], "01:01")
+        self.assertEqual(meta["media_url"], "https://example.com/video.mp4")
+
+    def test_ytdlp_meta_prefers_youtube_subtitles_as_caption(self):
+        collector = load_collector()
+        payload = {
+            "webpage_url": "https://www.youtube.com/watch?v=abc123xyz90",
+            "title": "YouTube 标题",
+            "thumbnail": "https://i.ytimg.com/vi/abc/hqdefault.jpg",
+            "duration": 61,
+            "url": "https://example.com/video.mp4",
+            "subtitles": {
+                "en": [
+                    {"ext": "json3", "url": "https://www.youtube.com/api/timedtext?v=abc&lang=en&fmt=json3"},
+                ],
+            },
+        }
+
+        class Result:
+            returncode = 0
+            stdout = __import__("json").dumps(payload)
+            stderr = ""
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_run = collector.subprocess.run
+        original_fetch = collector.fetch_youtube_caption_url
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.subprocess.run = lambda *args, **kwargs: Result()
+            collector.fetch_youtube_caption_url = lambda url, cfg: __import__("json").dumps({
+                "events": [
+                    {"segs": [{"utf8": "hello "}, {"utf8": "world"}]},
+                    {"segs": [{"utf8": "\\n"}]},
+                    {"segs": [{"utf8": "second line"}]},
+                ]
+            })
+
+            meta = collector.extract_with_ytdlp("https://www.youtube.com/watch?v=abc123xyz90", {"yt_dlp": {"enabled": True}})
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.subprocess.run = original_run
+            collector.fetch_youtube_caption_url = original_fetch
+
+        self.assertEqual(meta["caption"], "hello world second line")
+
+    def test_youtube_caption_from_initial_player_response(self):
+        collector = load_collector()
+        payload = {
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [
+                        {
+                            "languageCode": "en",
+                            "baseUrl": "https://www.youtube.com/api/timedtext?v=abc&lang=en&fmt=json3",
+                        }
+                    ]
+                }
+            }
+        }
+        original_fetch = collector.fetch_youtube_caption_url
+        try:
+            collector.fetch_youtube_caption_url = lambda url, cfg: __import__("json").dumps(
+                {"events": [{"segs": [{"utf8": "browser "}, {"utf8": "caption"}]}]}
+            )
+
+            caption = collector.youtube_caption_from_initial_player_response(payload, {})
+        finally:
+            collector.fetch_youtube_caption_url = original_fetch
+
+        self.assertEqual(caption, "browser caption")
+
+    def test_cdp_page_reuses_existing_youtube_tab(self):
+        collector = load_collector()
+
+        class Page:
+            def __init__(self, url):
+                self.url = url
+
+        class Context:
+            def __init__(self):
+                self.pages = [Page("https://www.youtube.com/watch?v=abc123xyz90")]
+                self.created = 0
+
+            def new_page(self):
+                self.created += 1
+                page = Page("about:blank")
+                self.pages.append(page)
+                return page
+
+        context = Context()
+        page = collector.cdp_page_for_url(context, "https://www.youtube.com/watch?v=abc123xyz90")
+
+        self.assertIs(page, context.pages[0])
+        self.assertEqual(context.created, 0)
+
+    def test_youtube_transcript_uses_cdp_before_playwright(self):
+        collector = load_collector()
+        calls = []
+
+        collector.extract_youtube_transcript_with_cdp = lambda url, cfg: calls.append(("cdp", url)) or "CDP transcript"
+        collector.launch_cdp_browser = lambda fallback_cfg, start_url="about:blank": calls.append(("launch", start_url))
+
+        result = collector.extract_youtube_transcript_with_browser(
+            "https://www.youtube.com/watch?v=pdCCk59woMQ",
+            {"browser_fallback": {"enabled": True}},
+        )
+
+        self.assertEqual(result, "CDP transcript")
+        self.assertEqual(calls, [("cdp", "https://www.youtube.com/watch?v=pdCCk59woMQ")])
+
+    def test_cdp_target_for_url_reuses_existing_youtube_target(self):
+        collector = load_collector()
+        calls = []
+        pages = [
+            {"type": "page", "url": "https://www.youtube.com/watch?v=pdCCk59woMQ", "webSocketDebuggerUrl": "ws://page-1"},
+            {"type": "page", "url": "https://www.youtube.com/", "webSocketDebuggerUrl": "ws://page-2"},
+        ]
+
+        collector.cdp_list_targets = lambda fallback_cfg: pages
+        collector.cdp_create_target = lambda fallback_cfg, url: calls.append(url) or {
+            "type": "page",
+            "url": url,
+            "webSocketDebuggerUrl": "ws://new-page",
+        }
+
+        target = collector.cdp_target_for_url({}, "https://youtu.be/pdCCk59woMQ?si=abc")
+
+        self.assertEqual(target["webSocketDebuggerUrl"], "ws://page-1")
+        self.assertEqual(calls, [])
+
+    def test_youtube_cdp_transcript_timeout_returns_empty_text(self):
+        collector = load_collector()
+        calls = []
+
+        collector.launch_cdp_browser = lambda fallback_cfg, url: calls.append(("launch", url))
+        collector.cdp_target_for_url = lambda fallback_cfg, url: {
+            "url": url,
+            "webSocketDebuggerUrl": "ws://page-1",
+        }
+
+        def fake_eval(websocket_url, expression, timeout=12):
+            if expression == "location.href":
+                return "https://www.youtube.com/watch?v=pdCCk59woMQ"
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "document.body ? document.body.innerText : ''":
+                return "女人最招架不住的3種男人思維"
+            if expression == "window.ytInitialPlayerResponse || {}":
+                return {}
+            raise TimeoutError()
+
+        collector.cdp_evaluate_sync = fake_eval
+
+        result = collector.extract_youtube_transcript_with_cdp(
+            "https://www.youtube.com/watch?v=pdCCk59woMQ",
+            {"browser_fallback": {"enabled": True}},
+        )
+
+        self.assertEqual(result, "")
+
+    def test_youtube_login_error_explains_empty_transcript_and_asr_download_gate(self):
+        collector = load_collector()
+
+        status, error = collector.youtube_desktop_error_status(
+            "需登录",
+            RuntimeError(
+                "YouTube 浏览器文字稿为空，已尝试音频 ASR 兜底但失败："
+                "yt-dlp 下载媒体失败：ERROR: [youtube] pdCCk59woMQ: Sign in to confirm you’re not a bot."
+            ),
+        )
+
+        self.assertEqual(status, "需登录")
+        self.assertIn("官方文字稿为空", error)
+        self.assertIn("刷新 YouTube 登录态/Cookie", error)
+
+    def test_desktop_youtube_transcribes_even_without_downloadable_media_url(self):
+        collector = load_collector()
+        db = Path(tempfile.mkdtemp(prefix="collector-test-")) / "desktop.sqlite3"
+        table = collector.desktop_create_table(db, "YouTube测试", "YouTube")
+        calls = []
+
+        original_preflight = collector.youtube_preflight_check
+        original_prepare = collector.youtube_prepare_browser_for_scrape
+        original_extract = collector.extract_from_page
+        original_transcribe = collector.transcribe_from_meta
+        try:
+            collector.youtube_preflight_check = lambda cfg: {"ok": True}
+
+            def fake_prepare(url, cfg):
+                raise AssertionError("desktop YouTube single scrape should not pre-open browser gate")
+
+            collector.youtube_prepare_browser_for_scrape = fake_prepare
+            collector.extract_from_page = lambda url, cfg: {
+                "source_url": url,
+                "final_url": url,
+                "platform": "YouTube",
+                "content_type": "video",
+                "title": "YouTube标题",
+                "caption": "",
+                "cover_url": "https://i.ytimg.com/vi/abc/maxresdefault.jpg",
+                "duration": "05:03",
+                "likes": None,
+                "comments": None,
+                "shares": None,
+                "published_at": "",
+                "media_url": "https://www.youtube.com/embed/abc123xyz90",
+            }
+
+            def fake_transcribe(cfg, meta):
+                calls.append(meta["source_url"])
+                return "浏览器逐字稿"
+
+            collector.transcribe_from_meta = fake_transcribe
+
+            item = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {},
+                "YouTube",
+                transcribe=True,
+            )
+        finally:
+            collector.youtube_preflight_check = original_preflight
+            collector.youtube_prepare_browser_for_scrape = original_prepare
+            collector.extract_from_page = original_extract
+            collector.transcribe_from_meta = original_transcribe
+
+        self.assertEqual(calls, ["https://www.youtube.com/watch?v=abc123xyz90"])
+        self.assertEqual(item["caption"], "浏览器逐字稿。")
+        self.assertEqual(item["status"], "成功")
+
+    def test_youtube_transcribe_reports_empty_browser_transcript_before_ytdlp_download_error(self):
+        collector = load_collector()
+        original_browser_transcript = collector.extract_youtube_transcript_with_browser
+        original_download_ytdlp = collector.download_media_with_ytdlp
+        try:
+            collector.extract_youtube_transcript_with_browser = lambda url, cfg: ""
+            collector.download_media_with_ytdlp = lambda url, cfg: (_ for _ in ()).throw(
+                RuntimeError("yt-dlp 下载媒体失败：Sign in to confirm you’re not a bot")
+            )
+            meta = {
+                "platform": "YouTube",
+                "source_url": "https://www.youtube.com/watch?v=abc123xyz90",
+                "content_type": "video",
+                "media_url": "https://www.youtube.com/embed/abc123xyz90",
+            }
+
+            with self.assertRaises(RuntimeError) as got:
+                collector.transcribe_from_meta({"browser_fallback": {"enabled": True}}, meta)
+        finally:
+            collector.extract_youtube_transcript_with_browser = original_browser_transcript
+            collector.download_media_with_ytdlp = original_download_ytdlp
+
+        self.assertIn("YouTube 浏览器文字稿为空", str(got.exception))
+        self.assertIn("Sign in to confirm", str(got.exception))
+
+    def test_youtube_falls_back_to_browser_when_ytdlp_requires_login(self):
+        collector = load_collector()
+        original_extract_ytdlp = collector.extract_with_ytdlp
+        original_real_browser = collector.extract_with_real_browser
+        original_browser_transcript = collector.extract_youtube_transcript_with_browser
+        try:
+            collector.extract_with_ytdlp = lambda url, cfg: (_ for _ in ()).throw(
+                RuntimeError("Sign in to confirm you’re not a bot")
+            )
+            collector.extract_with_real_browser = lambda url, cfg: {
+                "source_url": url,
+                "final_url": url,
+                "platform": "YouTube",
+                "content_type": "video",
+                "title": "浏览器标题",
+                "caption": "",
+                "cover_url": "",
+                "duration": "05:02",
+                "likes": None,
+                "comments": None,
+                "shares": None,
+                "published_at": "",
+                "media_url": "",
+            }
+            collector.extract_youtube_transcript_with_browser = lambda url, cfg: "浏览器文字稿"
+
+            meta = collector.extract_from_page(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {"browser_fallback": {"enabled": True}},
+            )
+        finally:
+            collector.extract_with_ytdlp = original_extract_ytdlp
+            collector.extract_with_real_browser = original_real_browser
+            collector.extract_youtube_transcript_with_browser = original_browser_transcript
+
+        self.assertEqual(meta["title"], "浏览器标题")
+        self.assertEqual(meta["caption"], "浏览器文字稿")
+
+    def test_ytdlp_args_include_proxy_and_extractor_args(self):
+        collector = load_collector()
+        payload = {
+            "webpage_url": "https://www.youtube.com/watch?v=abc123xyz90",
+            "title": "YouTube 标题",
+            "duration": 61,
+            "url": "https://example.com/video.mp4",
+        }
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = __import__("json").dumps(payload)
+            stderr = ""
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                return Result()
+
+            collector.subprocess.run = fake_run
+            collector.extract_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {
+                        "enabled": True,
+                        "proxy": "http://127.0.0.1:7897",
+                        "extractor_args": ["youtube:player_client=mweb"],
+                    }
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.subprocess.run = original_run
+
+        self.assertIn("--proxy", calls[0])
+        self.assertIn("http://127.0.0.1:7897", calls[0])
+        self.assertIn("--extractor-args", calls[0])
+        self.assertIn("youtube:player_client=mweb", calls[0])
+
+    def test_ytdlp_cookie_args_fall_back_to_app_directory_cookie_file(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        original_here = collector.HERE
+        try:
+            (temp_root / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+            collector.HERE = temp_root
+            cmd = ["yt-dlp"]
+            collector.add_ytdlp_cookie_args(cmd, {"yt_dlp": {"cookies_file": "/missing/old/cookies.txt"}})
+        finally:
+            collector.HERE = original_here
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertIn("--cookies", cmd)
+        self.assertIn(str(temp_root / "cookies.txt"), cmd)
+
+    def test_youtube_ytdlp_missing_raises_actionable_error(self):
+        collector = load_collector()
+        original_ytdlp_path = collector.ytdlp_path
+        try:
+            collector.ytdlp_path = lambda: None
+            with self.assertRaisesRegex(RuntimeError, "yt-dlp"):
+                collector.extract_with_ytdlp(
+                    "https://www.youtube.com/watch?v=abc123xyz90",
+                    {"yt_dlp": {"enabled": True}},
+                )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+
+    def test_youtube_embed_url_is_not_treated_as_media_stream(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.media_url_or_empty({"media_url": "https://www.youtube.com/embed/abc123xyz90"}), "")
+        self.assertEqual(collector.media_url_or_empty({"media_url": "https://example.com/watch?v=1"}), "")
+        self.assertEqual(collector.media_url_or_empty({"media_url": "https://example.com/video.mp4"}), "https://example.com/video.mp4")
+
+    def test_youtube_and_instagram_missing_metadata_reports_quality_message(self):
+        collector = load_collector()
+
+        youtube_message = collector.metadata_quality_message({
+            "platform": "YouTube",
+            "content_type": "video",
+            "title": "公开视频",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "https://www.youtube.com/embed/abc123xyz90",
+        })
+        instagram_message = collector.metadata_quality_message({
+            "platform": "Instagram",
+            "content_type": "",
+            "title": "Instagram",
+            "cover_url": "",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "",
+        })
+
+        self.assertIn("YouTube页面未暴露或未解析到", youtube_message)
+        self.assertIn("视频直链", youtube_message)
+        self.assertIn("Instagram页面未暴露或未解析到", instagram_message)
+        self.assertIn("作品标题", instagram_message)
+
+    def test_merge_meta_replaces_invalid_media_url_with_valid_stream(self):
+        collector = load_collector()
+
+        merged = collector.merge_meta(
+            {
+                "platform": "YouTube",
+                "media_url": "https://www.youtube.com/embed/abc123xyz90",
+                "title": "HTML标题",
+            },
+            {
+                "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback?expire=1",
+                "duration": "03:33",
+            },
+        )
+
+        self.assertEqual(merged["media_url"], "https://rr1---sn.example.googlevideo.com/videoplayback?expire=1")
+        self.assertEqual(merged["title"], "HTML标题")
+
+    def test_merge_meta_replaces_invalid_generic_youtube_title(self):
+        collector = load_collector()
+
+        merged = collector.merge_meta(
+            {"platform": "YouTube", "title": "- YouTube"},
+            {"title": "真实 YouTube 标题"},
+        )
+
+        self.assertEqual(merged["title"], "真实 YouTube 标题")
+
+    def test_extract_from_page_uses_ytdlp_first_for_youtube_when_html_is_forbidden(self):
+        collector = load_collector()
+        called = {"fetch": 0}
+
+        def forbidden_fetch(*args, **kwargs):
+            called["fetch"] += 1
+            raise RuntimeError("HTTP Error 403: Forbidden")
+
+        original_fetch = collector.fetch_text
+        original_ytdlp = collector.extract_with_ytdlp
+        try:
+            collector.fetch_text = forbidden_fetch
+            collector.extract_with_ytdlp = lambda url, cfg: {
+                "platform": "YouTube",
+                "content_type": "video",
+                "title": "yt-dlp 标题",
+                "cover_url": "https://i.ytimg.com/vi/abc/sddefault.jpg",
+                "duration": "05:02",
+                "likes": 1,
+                "comments": None,
+                "shares": None,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+                "caption": "",
+            }
+
+            meta = collector.extract_from_page("https://youtu.be/abc123xyz90", {"yt_dlp": {"enabled": True}})
+        finally:
+            collector.fetch_text = original_fetch
+            collector.extract_with_ytdlp = original_ytdlp
+
+        self.assertEqual(called["fetch"], 0)
+        self.assertEqual(meta["title"], "yt-dlp 标题")
+
+    def test_youtube_and_instagram_do_not_require_share_count_for_quality(self):
+        collector = load_collector()
+
+        youtube_message = collector.metadata_quality_message({
+            "platform": "YouTube",
+            "content_type": "video",
+            "title": "完整视频",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "03:33",
+            "likes": 10,
+            "comments": 2,
+            "shares": None,
+            "published_at": "2026年01月01日00时00分00秒",
+            "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+        })
+        instagram_message = collector.metadata_quality_message({
+            "platform": "Instagram",
+            "content_type": "video",
+            "title": "完整 Reel",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "00:12",
+            "likes": 10,
+            "comments": 2,
+            "shares": None,
+            "published_at": "2026年01月01日00时00分00秒",
+            "media_url": "https://scontent.cdninstagram.com/v/t50.2886-16/video",
+        })
+
+        self.assertEqual(youtube_message, "")
+        self.assertEqual(instagram_message, "")
+
+    def test_desktop_collect_selected_profile_items_only_scrapes_selected_urls(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            first = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/1",
+                    "source_type": "profile",
+                    "title": "候选1",
+                    "status": "候选",
+                    "raw_metadata_json": "{}",
+                },
+            )
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/2",
+                    "source_type": "profile",
+                    "title": "候选2",
+                    "status": "候选",
+                    "raw_metadata_json": "{}",
+                },
+            )
+            scraped = []
+
+            def fake_scrape(db_path, table_id, url, cfg, platform_hint="", source_type="single", transcribe=True):
+                scraped.append((url, transcribe))
+                return collector.desktop_save_item(
+                    db_path,
+                    table_id,
+                    {
+                        "platform": "抖音",
+                        "source_url": url,
+                        "source_type": "profile",
+                        "title": "已采集",
+                        "cover_url": "https://example.com/cover.jpg",
+                        "duration": "00:30",
+                        "status": "基础信息成功",
+                        "raw_metadata_json": "{}",
+                    },
+                )
+
+            original = collector.desktop_scrape_single_url
+            try:
+                collector.desktop_scrape_single_url = fake_scrape
+                result = collector.desktop_collect_selected_profile_items(
+                    db,
+                    table["id"],
+                    [first["id"]],
+                    {},
+                    "抖音",
+                    transcribe=False,
+                )
+            finally:
+                collector.desktop_scrape_single_url = original
+
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(scraped, [("https://www.douyin.com/video/1", False)])
+            statuses = {item["source_url"]: item["status"] for item in collector.desktop_list_items(db, table["id"])}
+            self.assertEqual(statuses["https://www.douyin.com/video/1"], "基础信息成功")
+            self.assertEqual(statuses["https://www.douyin.com/video/2"], "候选")
+
+    def test_desktop_delete_table_removes_items_and_keeps_one_table(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            default_table = collector.desktop_list_tables(db)[0]
+            custom = collector.desktop_create_table(db, "临时表", "抖音")
+            collector.desktop_save_item(
+                db,
+                custom["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/delete-me",
+                    "source_type": "single",
+                    "title": "待删除",
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            result = collector.desktop_delete_table(db, custom["id"])
+
+            self.assertEqual(result["deleted_id"], custom["id"])
+            self.assertEqual(result["next_table"]["id"], default_table["id"])
+            self.assertEqual(len(collector.desktop_list_tables(db)), 1)
+            self.assertEqual(collector.desktop_list_items(db, custom["id"]), [])
+
+            with self.assertRaises(ValueError):
+                collector.desktop_delete_table(db, default_table["id"])
+
+    def test_desktop_scrape_single_url_reuses_existing_scraper_and_asr(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "抖音",
+                "content_type": "video",
+                "source_url": url,
+                "title": "视频标题",
+                "caption": "",
+                "cover_url": "https://example.com/cover.jpg",
+                "duration": "00:30",
+                "likes": 10,
+                "comments": 2,
+                "shares": 1,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://example.com/video.mp4",
+            }
+            collector.transcribe_from_meta = lambda cfg, meta: "这是逐字稿。"
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://www.douyin.com/video/1",
+                {"asr": {}},
+            )
+
+            self.assertEqual(result["status"], "成功")
+            self.assertEqual(result["caption"], "这是逐字稿。")
+            self.assertEqual(collector.desktop_list_items(db, table["id"])[0]["title"], "视频标题")
+
+    def test_desktop_profile_scrape_can_skip_asr_for_fast_batch_metadata(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "抖音",
+                "content_type": "video",
+                "source_url": url,
+                "title": "主页批量标题",
+                "caption": "",
+                "cover_url": "https://example.com/cover.jpg",
+                "duration": "00:30",
+                "likes": 10,
+                "comments": 2,
+                "shares": 1,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://example.com/video.mp4",
+            }
+            collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(AssertionError("ASR should be skipped"))
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://www.douyin.com/video/1",
+                {"asr": {}},
+                "抖音",
+                source_type="profile",
+                transcribe=False,
+            )
+
+            self.assertEqual(result["title"], "主页批量标题")
+            self.assertEqual(result["caption"], "")
+            self.assertIn("主页批量模式", result["error"])
+
+    def test_desktop_youtube_scrape_saves_metadata_when_asr_is_unavailable(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "YouTube",
+                "content_type": "video",
+                "source_url": url,
+                "title": "YouTube 标题",
+                "caption": "",
+                "cover_url": "https://i.ytimg.com/vi/abc/maxresdefault.jpg",
+                "duration": "03:33",
+                "likes": 10,
+                "comments": 2,
+                "shares": None,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+            }
+            collector.desktop_asr_available = lambda cfg: False
+            collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(AssertionError("ASR should not run"))
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {"asr": {"backend": "local"}},
+                "YouTube",
+            )
+
+            self.assertEqual(result["status"], "字幕缺失")
+            self.assertEqual(result["title"], "YouTube 标题")
+            self.assertEqual(result["caption"], "")
+            self.assertIn("没有可用字幕", result["error"])
+
+    def test_desktop_scrape_preserves_metadata_when_transcription_fails(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "YouTube",
+                "content_type": "video",
+                "source_url": url,
+                "title": "YouTube 标题",
+                "caption": "",
+                "cover_url": "https://i.ytimg.com/vi/abc/sddefault.jpg",
+                "duration": "05:02",
+                "likes": 1,
+                "comments": None,
+                "shares": None,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+            }
+            collector.desktop_asr_available = lambda cfg: True
+            collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(RuntimeError("HTTP Error 403: Forbidden"))
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://youtu.be/abc123xyz90",
+                {"asr": {"backend": "local"}},
+                "YouTube",
+            )
+
+            self.assertEqual(result["title"], "YouTube 标题")
+            self.assertEqual(result["cover_url"], "https://i.ytimg.com/vi/abc/sddefault.jpg")
+            self.assertEqual(result["duration"], "05:02")
+            self.assertEqual(result["status"], "ASR失败")
+            self.assertEqual(result["caption"], "")
+            self.assertIn("HTTP Error 403", result["error"])
+
+    def test_desktop_youtube_download_403_reports_download_limited(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: {
+                "platform": "YouTube",
+                "content_type": "video",
+                "source_url": url,
+                "final_url": "https://www.youtube.com/watch?v=abc123xyz90",
+                "title": "YouTube 标题",
+                "caption": "",
+                "cover_url": "https://i.ytimg.com/vi/abc/sddefault.jpg",
+                "duration": "05:02",
+                "likes": 1,
+                "comments": None,
+                "shares": None,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+            }
+            collector.desktop_asr_available = lambda cfg: True
+            collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(
+                RuntimeError("yt-dlp 下载媒体失败：HTTP Error 403: Forbidden")
+            )
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://youtu.be/abc123xyz90",
+                {"youtube_safety": {"enabled": True, "preflight": False}},
+                "YouTube",
+            )
+
+            self.assertEqual(result["title"], "YouTube 标题")
+            self.assertEqual(result["status"], "YouTube下载受限")
+            self.assertIn("VPN", result["error"])
+
+    def test_desktop_youtube_does_not_open_browser_gate_before_scrape_when_metadata_has_caption(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            calls = []
+            original_gate = collector.youtube_prepare_browser_for_scrape
+            try:
+                collector.youtube_prepare_browser_for_scrape = lambda url, cfg: calls.append(url) or {"ok": True}
+                collector.extract_from_page = lambda url, cfg: {
+                    "platform": "YouTube",
+                    "content_type": "video",
+                    "source_url": url,
+                    "title": "YouTube 标题",
+                    "caption": "已有字幕",
+                    "cover_url": "",
+                    "duration": "01:00",
+                    "likes": None,
+                    "comments": None,
+                    "shares": None,
+                    "published_at": "",
+                    "media_url": "",
+                }
+
+                result = collector.desktop_scrape_single_url(
+                    db,
+                    table["id"],
+                    "https://www.youtube.com/watch?v=abc123xyz90",
+                    {
+                        "youtube_safety": {"enabled": True, "preflight": False, "open_browser_before_scrape": True},
+                        "browser_fallback": {"enabled": True},
+                    },
+                    "YouTube",
+                )
+            finally:
+                collector.youtube_prepare_browser_for_scrape = original_gate
+
+            self.assertEqual(calls, [])
+            self.assertEqual(result["status"], "成功")
+
+    def test_desktop_youtube_login_error_from_scraper_is_saved(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            original_gate = collector.youtube_prepare_browser_for_scrape
+            original_extract = collector.extract_from_page
+            try:
+                collector.youtube_prepare_browser_for_scrape = lambda url, cfg: (_ for _ in ()).throw(
+                    RuntimeError("YouTube 要求登录验证：请在专用浏览器里完成 YouTube 登录/机器人验证后重试。")
+                )
+                collector.extract_from_page = lambda url, cfg: (_ for _ in ()).throw(
+                    RuntimeError("YouTube 要求登录验证：请在专用浏览器里完成 YouTube 登录/机器人验证后重试。")
+                )
+
+                result = collector.desktop_scrape_single_url(
+                    db,
+                    table["id"],
+                    "https://www.youtube.com/watch?v=abc123xyz90",
+                    {
+                        "youtube_safety": {"enabled": True, "preflight": False, "open_browser_before_scrape": True},
+                        "browser_fallback": {"enabled": True},
+                    },
+                    "YouTube",
+                )
+            finally:
+                collector.youtube_prepare_browser_for_scrape = original_gate
+                collector.extract_from_page = original_extract
+
+            self.assertEqual(result["status"], "需登录")
+            self.assertIn("登录验证", result["error"])
+
+    def test_transcribe_from_meta_uses_ytdlp_for_youtube_instead_of_expiring_media_url(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        media_path = temp_root / "media.mp4"
+        media_path.write_bytes(b"fake video")
+        audio_path = temp_root / "audio.mp3"
+        calls = []
+
+        def fake_download_media_file(url, cfg, platform):
+            raise AssertionError("YouTube ASR should not download expiring googlevideo URL directly")
+
+        def fake_download_media_with_ytdlp(url, cfg):
+            calls.append(url)
+            return media_path
+
+        original_download_file = collector.download_media_file
+        original_download_ytdlp = collector.download_media_with_ytdlp
+        original_extract_audio = collector.extract_audio_file
+        original_transcribe_audio = collector.transcribe_audio_file
+        try:
+            collector.download_media_file = fake_download_media_file
+            collector.download_media_with_ytdlp = fake_download_media_with_ytdlp
+            collector.extract_audio_file = lambda path: audio_path
+            collector.transcribe_audio_file = lambda cfg, path: "YouTube 转写结果"
+
+            text = collector.transcribe_from_meta(
+                {},
+                {
+                    "platform": "YouTube",
+                    "source_url": "https://youtu.be/abc123xyz90",
+                    "final_url": "https://www.youtube.com/watch?v=abc123xyz90",
+                    "media_url": "https://rr4---sn.example.googlevideo.com/videoplayback",
+                },
+            )
+        finally:
+            collector.download_media_file = original_download_file
+            collector.download_media_with_ytdlp = original_download_ytdlp
+            collector.extract_audio_file = original_extract_audio
+            collector.transcribe_audio_file = original_transcribe_audio
+
+        self.assertEqual(text, "YouTube 转写结果")
+        self.assertEqual(calls, ["https://www.youtube.com/watch?v=abc123xyz90"])
+        self.assertFalse(temp_root.exists())
+
+    def test_transcribe_from_meta_prefers_youtube_browser_transcript(self):
+        collector = load_collector()
+        original_browser_transcript = collector.extract_youtube_transcript_with_browser
+        original_download_ytdlp = collector.download_media_with_ytdlp
+        try:
+            collector.extract_youtube_transcript_with_browser = lambda url, cfg: "浏览器文字稿"
+            collector.download_media_with_ytdlp = lambda url, cfg: (_ for _ in ()).throw(
+                AssertionError("YouTube browser transcript should run before audio download")
+            )
+
+            text = collector.transcribe_from_meta(
+                {"browser_fallback": {"enabled": True}},
+                {
+                    "platform": "YouTube",
+                    "source_url": "https://youtu.be/abc123xyz90",
+                    "final_url": "https://www.youtube.com/watch?v=abc123xyz90",
+                    "media_url": "https://rr4---sn.example.googlevideo.com/videoplayback",
+                },
+            )
+        finally:
+            collector.extract_youtube_transcript_with_browser = original_browser_transcript
+            collector.download_media_with_ytdlp = original_download_ytdlp
+
+        self.assertEqual(text, "浏览器文字稿。")
+
+    def test_download_media_with_ytdlp_uses_configured_proxy_and_format(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                (temp_root / "media.mp4").write_bytes(b"fake")
+                return Result()
+
+            collector.subprocess.run = fake_run
+            path = collector.download_media_with_ytdlp(
+                "https://youtu.be/abc123xyz90",
+                {"yt_dlp": {"enabled": True, "proxy": "http://127.0.0.1:7897", "download_format": "18/best"}},
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+
+        self.assertEqual(path.name, "media.mp4")
+        self.assertIn("--proxy", calls[0])
+        self.assertIn("http://127.0.0.1:7897", calls[0])
+        self.assertIn("-f", calls[0])
+        self.assertIn("18/best", calls[0])
+
+    def test_add_ytdlp_common_args_includes_js_runtime(self):
+        collector = load_collector()
+        cmd = ["yt-dlp"]
+
+        collector.add_ytdlp_common_args(cmd, {"yt_dlp": {"js_runtimes": "node:/tmp/node"}})
+
+        self.assertIn("--js-runtimes", cmd)
+        self.assertIn("node:/tmp/node", cmd)
+
+    def test_ensure_ffmpeg_on_path_prepends_ffmpeg_directory(self):
+        collector = load_collector()
+        original_path = collector.os.environ.get("PATH", "")
+        original_ffmpeg_path = collector.ffmpeg_path
+        try:
+            collector.os.environ["PATH"] = "/usr/bin"
+            collector.ffmpeg_path = lambda: "/tmp/chen-bin/ffmpeg"
+
+            collector.ensure_ffmpeg_on_path()
+
+            self.assertTrue(collector.os.environ["PATH"].startswith("/tmp/chen-bin:"))
+        finally:
+            collector.ffmpeg_path = original_ffmpeg_path
+            collector.os.environ["PATH"] = original_path
+
+    def test_download_media_with_ytdlp_retries_youtube_client_strategies(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            def __init__(self, returncode, stderr=""):
+                self.returncode = returncode
+                self.stdout = ""
+                self.stderr = stderr
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                if "youtube:player_client=mweb" not in cmd:
+                    return Result(1, "HTTP Error 403: Forbidden")
+                (temp_root / "media.m4a").write_bytes(b"fake")
+                return Result(0)
+
+            collector.subprocess.run = fake_run
+            path = collector.download_media_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {
+                        "enabled": True,
+                        "youtube_retry_extractor_args": ["youtube:player_client=mweb"],
+                    }
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertEqual(path.name, "media.m4a")
+        self.assertNotIn("youtube:player_client=mweb", calls[0])
+        self.assertTrue(any("youtube:player_client=mweb" in cmd for cmd in calls[1:]))
+
+    def test_download_media_with_ytdlp_retries_login_browser_cookie_source(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            def __init__(self, returncode, stderr=""):
+                self.returncode = returncode
+                self.stdout = ""
+                self.stderr = stderr
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                source = cmd[cmd.index("--cookies-from-browser") + 1]
+                if source == "edge":
+                    return Result(1, "Sign in to confirm you’re not a bot")
+                (temp_root / "media.m4a").write_bytes(b"fake")
+                return Result(0)
+
+            collector.subprocess.run = fake_run
+            path = collector.download_media_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {
+                        "enabled": True,
+                        "cookies_from_browser": "edge",
+                        "youtube_retry_extractor_args": [],
+                    },
+                    "browser_fallback": {
+                        "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    },
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertEqual(path.name, "media.m4a")
+        seen_sources = []
+        for cmd in calls:
+            source = cmd[cmd.index("--cookies-from-browser") + 1]
+            if source not in seen_sources:
+                seen_sources.append(source)
+        self.assertEqual(seen_sources, ["edge", "chrome"])
+
+    def test_download_media_with_ytdlp_uses_cdp_exported_cookies_before_browser_decrypt(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        original_export = getattr(collector, "export_youtube_cookies_from_cdp", None)
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_export(url, cfg, cookie_path):
+                cookie_path.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+                return cookie_path
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                (temp_root / "media.m4a").write_bytes(b"fake")
+                return Result()
+
+            collector.export_youtube_cookies_from_cdp = fake_export
+            collector.subprocess.run = fake_run
+            path = collector.download_media_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {
+                        "enabled": True,
+                        "cookies_from_browser": "chrome:/tmp/profile",
+                        "youtube_retry_extractor_args": [],
+                    },
+                    "browser_fallback": {"enabled": True, "profile_dir": "/tmp/profile"},
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+            if original_export is not None:
+                collector.export_youtube_cookies_from_cdp = original_export
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertEqual(path.name, "media.m4a")
+        self.assertIn("--cookies", calls[0])
+        self.assertNotIn("--cookies-from-browser", calls[0])
+
+    def test_download_media_with_ytdlp_retries_fallback_format_when_requested_missing(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            def __init__(self, returncode, stderr=""):
+                self.returncode = returncode
+                self.stdout = ""
+                self.stderr = stderr
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                fmt = cmd[cmd.index("-f") + 1]
+                if fmt == "ba[ext=m4a]/ba":
+                    return Result(1, "Requested format is not available")
+                (temp_root / "media.webm").write_bytes(b"fake")
+                return Result(0)
+
+            collector.subprocess.run = fake_run
+            path = collector.download_media_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {
+                        "enabled": True,
+                        "download_format": "ba[ext=m4a]/ba",
+                        "youtube_retry_extractor_args": [],
+                    }
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertEqual(path.name, "media.webm")
+        self.assertEqual(calls[0][calls[0].index("-f") + 1], "ba[ext=m4a]/ba")
+        self.assertEqual(calls[1][calls[1].index("-f") + 1], "bestaudio/best")
+
+    def test_download_media_with_ytdlp_probe_mode_limits_attempts(self):
+        collector = load_collector()
+        temp_root = Path(tempfile.mkdtemp(prefix="collector-test-"))
+        calls = []
+
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "HTTP Error 403: Forbidden"
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_mkdtemp = collector.tempfile.mkdtemp
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+            collector.tempfile.mkdtemp = lambda prefix: str(temp_root)
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                return Result()
+
+            collector.subprocess.run = fake_run
+            with self.assertRaises(RuntimeError):
+                collector.download_media_with_ytdlp(
+                    "https://www.youtube.com/watch?v=abc123xyz90",
+                    {
+                        "yt_dlp": {
+                            "enabled": True,
+                            "_download_probe": True,
+                            "download_probe_max_attempts": 2,
+                            "youtube_retry_extractor_args": ["youtube:player_client=mweb"],
+                        }
+                    },
+                )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.tempfile.mkdtemp = original_mkdtemp
+            collector.subprocess.run = original_run
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_download_media_with_ytdlp_adds_po_token_extractor_arg(self):
+        collector = load_collector()
+
+        strategies = collector.ytdlp_download_strategies(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {
+                "yt_dlp": {
+                    "youtube_po_token": "mweb.gvs+TOKEN",
+                    "youtube_retry_extractor_args": [],
+                }
+            },
+        )
+
+        self.assertEqual(strategies[0], "youtube:player_client=mweb;po_token=mweb.gvs+TOKEN")
+        self.assertIn("youtube:player_client=mweb;po_token=mweb.gvs+TOKEN", strategies)
+
+    def test_download_media_with_ytdlp_prioritizes_po_token_provider_mweb(self):
+        collector = load_collector()
+
+        strategies = collector.ytdlp_download_strategies(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {
+                "yt_dlp": {
+                    "youtube_po_token_provider": True,
+                    "youtube_retry_extractor_args": ["youtube:player_client=ios"],
+                }
+            },
+        )
+
+        self.assertEqual(strategies[0], "youtube:player_client=mweb")
+        self.assertIn("youtube:player_client=ios", strategies)
+
+    def test_youtube_diagnose_config_reports_po_token_provider(self):
+        collector = load_collector()
+
+        config = collector.youtube_diagnose_config(
+            {"yt_dlp": {"youtube_po_token_provider": True}},
+            "https://www.youtube.com/watch?v=abc123xyz90",
+        )
+
+        self.assertTrue(config["po_token_provider_enabled"])
+        self.assertEqual(config["retry_strategies"][0], "youtube:player_client=mweb")
+
+    def test_save_youtube_po_provider_config_preserves_existing_config(self):
+        collector = load_collector()
+        config_path = Path(tempfile.mkdtemp(prefix="collector-config-")) / "config.json"
+        try:
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "feishu": {"app_secret": "SECRET"},
+                        "yt_dlp": {"cookies_from_browser": "chrome"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = collector.save_youtube_po_provider_config(config_path, True)
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+        finally:
+            shutil.rmtree(config_path.parent, ignore_errors=True)
+
+        self.assertTrue(result["youtube_po_token_provider"])
+        self.assertEqual(saved["feishu"]["app_secret"], "SECRET")
+        self.assertEqual(saved["yt_dlp"]["cookies_from_browser"], "chrome")
+        self.assertTrue(saved["yt_dlp"]["youtube_po_token_provider"])
+
+    def test_youtube_diagnose_reports_caption_available_without_download_probe(self):
+        collector = load_collector()
+        calls = []
+        collector.youtube_preflight_check = lambda cfg: {"ok": True, "status": "可采集", "error": ""}
+        collector.extract_with_ytdlp = lambda url, cfg: {
+            "platform": "YouTube",
+            "title": "YouTube 标题",
+            "caption": "已有字幕",
+            "duration": "01:01",
+        }
+        collector.download_media_with_ytdlp = lambda url, cfg: calls.append(url)
+
+        result = collector.youtube_diagnose_url(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {"yt_dlp": {"enabled": True}},
+        )
+
+        self.assertEqual(result["status"], "字幕可用")
+        self.assertTrue(result["checks"]["captions"]["ok"])
+        self.assertEqual(calls, [])
+
+    def test_youtube_diagnose_download_probe_points_to_po_token(self):
+        collector = load_collector()
+        collector.youtube_preflight_check = lambda cfg: {"ok": True, "status": "可采集", "error": ""}
+        collector.extract_with_ytdlp = lambda url, cfg: {
+            "platform": "YouTube",
+            "title": "YouTube 标题",
+            "caption": "",
+            "duration": "01:01",
+        }
+        collector.download_media_with_ytdlp = lambda url, cfg: (_ for _ in ()).throw(
+            RuntimeError("yt-dlp 下载媒体失败：default: HTTP Error 403: Forbidden")
+        )
+
+        result = collector.youtube_diagnose_url(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {"yt_dlp": {"enabled": True, "youtube_po_token": ""}},
+            probe_download=True,
+        )
+
+        self.assertEqual(result["status"], "下载需PO Token")
+        self.assertFalse(result["checks"]["download_probe"]["ok"])
+        self.assertIn("PO Token", result["recommended_action"])
+
+    def test_youtube_diagnose_flags_browser_cookie_mismatch(self):
+        collector = load_collector()
+        config = collector.youtube_diagnose_config(
+            {
+                "yt_dlp": {"cookies_from_browser": "edge"},
+                "browser_fallback": {
+                    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                },
+            },
+            "https://www.youtube.com/watch?v=abc123xyz90",
+        )
+
+        self.assertTrue(config["browser_cookie_mismatch"])
+        self.assertEqual(config["login_browser"], "chrome")
+        self.assertEqual(config["cookie_browser"], "edge")
+        self.assertIn("统一", config["cookie_advice"])
+
+    def test_ytdlp_cookie_sources_retry_login_browser_when_mismatch(self):
+        collector = load_collector()
+
+        sources = collector.ytdlp_cookie_sources(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {
+                "yt_dlp": {"cookies_from_browser": "edge"},
+                "browser_fallback": {
+                    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                },
+            },
+        )
+
+        self.assertEqual(sources, ["edge", "chrome"])
+
+    def test_ytdlp_cookie_sources_include_dedicated_login_profile(self):
+        collector = load_collector()
+
+        sources = collector.ytdlp_cookie_sources(
+            "https://www.youtube.com/watch?v=abc123xyz90",
+            {
+                "yt_dlp": {"cookies_from_browser": "edge"},
+                "browser_fallback": {
+                    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "profile_dir": "/tmp/chen-youtube-profile",
+                },
+            },
+        )
+
+        self.assertEqual(sources, ["edge", "chrome:/tmp/chen-youtube-profile", "chrome"])
+
+    def test_extract_with_ytdlp_retries_login_browser_cookie_after_cookie_error(self):
+        collector = load_collector()
+        calls = []
+        payload = {
+            "webpage_url": "https://www.youtube.com/watch?v=abc123xyz90",
+            "title": "YouTube 标题",
+            "duration": 61,
+            "url": "https://example.com/video.mp4",
+        }
+
+        class Result:
+            def __init__(self, returncode, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        original_ytdlp_path = collector.ytdlp_path
+        original_run = collector.subprocess.run
+        try:
+            collector.ytdlp_path = lambda: "/usr/local/bin/yt-dlp"
+
+            def fake_run(cmd, *args, **kwargs):
+                calls.append(cmd)
+                if "--cookies-from-browser" in cmd and cmd[cmd.index("--cookies-from-browser") + 1] == "edge":
+                    return Result(1, stderr="Sign in to confirm you’re not a bot")
+                return Result(0, stdout=__import__("json").dumps(payload))
+
+            collector.subprocess.run = fake_run
+            meta = collector.extract_with_ytdlp(
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {
+                    "yt_dlp": {"enabled": True, "cookies_from_browser": "edge"},
+                    "browser_fallback": {
+                        "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    },
+                },
+            )
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+            collector.subprocess.run = original_run
+
+        self.assertEqual(meta["title"], "YouTube 标题")
+        self.assertEqual([cmd[cmd.index("--cookies-from-browser") + 1] for cmd in calls], ["edge", "chrome"])
+
+    def test_desktop_app_exposes_youtube_diagnose_entry(self):
+        collector = load_collector()
+
+        self.assertIn("/api/youtube/diagnose", collector.DESKTOP_APP_HTML)
+        self.assertIn("/api/youtube/po-provider-enable", collector.DESKTOP_APP_HTML)
+        self.assertIn("YouTube修复", collector.DESKTOP_APP_HTML)
+        self.assertIn("检查失败原因", collector.DESKTOP_APP_HTML)
+        self.assertIn("测试能否转写", collector.DESKTOP_APP_HTML)
+        self.assertIn("增强下载", collector.DESKTOP_APP_HTML)
+        self.assertNotIn(">诊断YouTube<", collector.DESKTOP_APP_HTML)
+        self.assertNotIn(">下载探测<", collector.DESKTOP_APP_HTML)
+        self.assertNotIn(">启用PO模式<", collector.DESKTOP_APP_HTML)
+        self.assertIn("toggleYouTubeTools()", collector.DESKTOP_APP_HTML)
+        self.assertIn("diagnoseYouTube(true)", collector.DESKTOP_APP_HTML)
+        self.assertIn("probe_download:probe", collector.DESKTOP_APP_HTML)
+
+    def test_youtube_preflight_reports_missing_ytdlp(self):
+        collector = load_collector()
+        original_ytdlp_path = collector.ytdlp_path
+        try:
+            collector.ytdlp_path = lambda: None
+            result = collector.youtube_preflight_check({"youtube_safety": {"enabled": True}})
+        finally:
+            collector.ytdlp_path = original_ytdlp_path
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "yt-dlp缺失")
+        self.assertIn("yt-dlp", result["error"])
+
+    def test_desktop_youtube_network_errors_are_labeled_vpn_network(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.extract_from_page = lambda url, cfg: (_ for _ in ()).throw(RuntimeError("urlopen error DNS failed"))
+
+            result = collector.desktop_scrape_single_url(
+                db,
+                table["id"],
+                "https://www.youtube.com/watch?v=abc123xyz90",
+                {"youtube_safety": {"enabled": True, "preflight": False}},
+                "YouTube",
+            )
+
+            self.assertEqual(result["status"], "VPN/网络异常")
+            self.assertIn("VPN", result["error"])
+
+    def test_desktop_collect_selected_youtube_throttles_between_items(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            first = collector.desktop_save_item(
+                db,
+                table["id"],
+                {"platform": "YouTube", "source_url": "https://www.youtube.com/watch?v=one12345678", "source_type": "profile", "status": "候选"},
+            )
+            second = collector.desktop_save_item(
+                db,
+                table["id"],
+                {"platform": "YouTube", "source_url": "https://www.youtube.com/watch?v=two12345678", "source_type": "profile", "status": "候选"},
+            )
+            sleeps = []
+
+            def fake_scrape(db_path, table_id, url, cfg, platform_hint="", source_type="single", transcribe=True):
+                return collector.desktop_save_item(
+                    db_path,
+                    table_id,
+                    {"platform": "YouTube", "source_url": url, "source_type": source_type, "title": "ok", "status": "基础信息成功"},
+                )
+
+            original_scrape = collector.desktop_scrape_single_url
+            original_sleep = collector.time.sleep
+            try:
+                collector.desktop_scrape_single_url = fake_scrape
+                collector.time.sleep = lambda seconds: sleeps.append(seconds)
+                result = collector.desktop_collect_selected_profile_items(
+                    db,
+                    table["id"],
+                    [first["id"], second["id"]],
+                    {"youtube_safety": {"enabled": True, "throttle_seconds": 2.5}},
+                    "YouTube",
+                    transcribe=False,
+                )
+            finally:
+                collector.desktop_scrape_single_url = original_scrape
+                collector.time.sleep = original_sleep
+
+            self.assertEqual(result["processed_count"], 2)
+            self.assertEqual(sleeps, [2.5])
+
+    def test_desktop_collect_selected_youtube_pauses_after_network_failures(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            ids = []
+            for index in range(3):
+                saved = collector.desktop_save_item(
+                    db,
+                    table["id"],
+                    {
+                        "platform": "YouTube",
+                        "source_url": f"https://www.youtube.com/watch?v=fail{index}12345",
+                        "source_type": "profile",
+                        "status": "候选",
+                    },
+                )
+                ids.append(saved["id"])
+            calls = []
+
+            def fake_scrape(db_path, table_id, url, cfg, platform_hint="", source_type="single", transcribe=True):
+                calls.append(url)
+                return collector.desktop_save_item(
+                    db_path,
+                    table_id,
+                    {"platform": "YouTube", "source_url": url, "source_type": source_type, "status": "VPN/网络异常", "error": "VPN 不稳定"},
+                )
+
+            original_scrape = collector.desktop_scrape_single_url
+            try:
+                collector.desktop_scrape_single_url = fake_scrape
+                result = collector.desktop_collect_selected_profile_items(
+                    db,
+                    table["id"],
+                    ids,
+                    {"youtube_safety": {"enabled": True, "throttle_seconds": 0, "max_consecutive_network_failures": 2}},
+                    "YouTube",
+                    transcribe=False,
+                )
+            finally:
+                collector.desktop_scrape_single_url = original_scrape
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result["processed_count"], 2)
+            self.assertTrue(result["paused"])
+            self.assertIn("VPN", result["message"])
+
+    def test_desktop_local_asr_requires_ffmpeg(self):
+        collector = load_collector()
+        original_ffmpeg_path = collector.ffmpeg_path
+        try:
+            collector.ffmpeg_path = lambda: ""
+            self.assertFalse(collector.desktop_asr_available({"asr": {"backend": "local"}}))
+        finally:
+            collector.ffmpeg_path = original_ffmpeg_path
+
+    def test_desktop_profile_complete_counts_only_successful_core_data(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            session_id = "profile-session-test"
+            collector.DESKTOP_PROFILE_SESSIONS[session_id] = {
+                "found_count": 1,
+                "completed_count": 0,
+                "error_count": 0,
+                "updated_at": "",
+            }
+            calls = []
+
+            def fake_scrape(*args, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "status": "等待登录",
+                    "title": "",
+                    "cover_url": "",
+                    "duration": "",
+                }
+
+            original_scrape = collector.desktop_scrape_single_url
+            original_sleep = collector.time.sleep
+            try:
+                collector.desktop_scrape_single_url = fake_scrape
+                collector.time.sleep = lambda _seconds: None
+                collector.desktop_profile_complete_video(
+                    session_id,
+                    db,
+                    table["id"],
+                    "https://www.douyin.com/video/wait-login",
+                    {},
+                )
+            finally:
+                collector.desktop_scrape_single_url = original_scrape
+                collector.time.sleep = original_sleep
+                session = collector.DESKTOP_PROFILE_SESSIONS.pop(session_id)
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(session["completed_count"], 0)
+            self.assertEqual(session["error_count"], 1)
+            self.assertIn("待处理 1 条", session["message"])
+
+    def test_desktop_profile_complete_passes_target_platform_to_scraper(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            session_id = "youtube-profile-session-test"
+            collector.DESKTOP_PROFILE_SESSIONS[session_id] = {
+                "found_count": 1,
+                "completed_count": 0,
+                "error_count": 0,
+                "updated_at": "",
+            }
+            calls = []
+
+            def fake_scrape(db_path, table_id, url, cfg, platform_hint="", source_type="single", transcribe=True):
+                calls.append((platform_hint, source_type, transcribe))
+                return {
+                    "status": "基础信息成功",
+                    "title": "YouTube 标题",
+                    "cover_url": "https://i.ytimg.com/vi/abc/sddefault.jpg",
+                    "duration": "05:02",
+                }
+
+            original_scrape = collector.desktop_scrape_single_url
+            try:
+                collector.desktop_scrape_single_url = fake_scrape
+                collector.desktop_profile_complete_video(
+                    session_id,
+                    db,
+                    table["id"],
+                    "https://www.youtube.com/watch?v=abc123xyz90",
+                    {},
+                    "YouTube",
+                )
+            finally:
+                collector.desktop_scrape_single_url = original_scrape
+                collector.DESKTOP_PROFILE_SESSIONS.pop(session_id)
+
+            self.assertEqual(calls, [("YouTube", "profile", False)])
+
+    def test_load_config_fills_default_browser_executable_when_available(self):
+        collector = load_collector()
+        original = collector.DEFAULT_BROWSER_EXECUTABLES
+        with tempfile.TemporaryDirectory() as tmp:
+            browser = Path(tmp) / "Chrome"
+            browser.write_text("", encoding="utf-8")
+            cfg_path = Path(tmp) / "config.json"
+            cfg_path.write_text('{"browser_fallback":{"executable_path":""}}', encoding="utf-8")
+            collector.DEFAULT_BROWSER_EXECUTABLES = [str(browser)]
+            try:
+                cfg = collector.load_config(cfg_path)
+            finally:
+                collector.DEFAULT_BROWSER_EXECUTABLES = original
+
+            self.assertEqual(cfg["browser_fallback"]["executable_path"], str(browser))
 
     def test_iter_json_objects_reads_xiaohongshu_initial_state(self):
         collector = load_collector()
@@ -529,13 +3561,30 @@ class WebhookHelperTests(unittest.TestCase):
         collector = load_collector()
 
         self.assertEqual(collector.classify_processing_error(RuntimeError("yt-dlp 需要登录 Cookie")), "需Cookie")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("Sign in to confirm you’re not a bot")), "需登录")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("YouTube 要求登录验证")), "需登录")
         self.assertEqual(collector.classify_processing_error(RuntimeError("抖音要求刷新登录态")), "需登录")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("等待登录：请完成登录")), "等待登录")
         self.assertEqual(collector.classify_processing_error(RuntimeError("这是图文作品，没有视频音频")), "图文作品")
         self.assertEqual(collector.classify_processing_error(RuntimeError("未拿到视频/音频直链")), "平台限制")
         self.assertEqual(collector.classify_processing_error(RuntimeError("音频流为空 no audio stream")), "无音频")
         self.assertEqual(collector.classify_processing_error(RuntimeError("ffmpeg 抽取音频失败")), "下载失败")
-        self.assertEqual(collector.classify_processing_error(RuntimeError("OpenAI 转写失败 HTTP 500")), "转写失败")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("OpenAI 转写失败 HTTP 500")), "ASR失败")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("本机没有找到 yt-dlp")), "yt-dlp缺失")
+        self.assertEqual(collector.classify_processing_error(RuntimeError("YouTube 没有可用字幕")), "字幕缺失")
         self.assertEqual(collector.classify_processing_error(RuntimeError("其它错误")), "待人工确认")
+
+    def test_classify_browser_target_closed_as_waiting_login(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.classify_processing_error(RuntimeError("等待登录：真实浏览器页面已关闭")),
+            "等待登录",
+        )
+        self.assertEqual(
+            collector.classify_processing_error(RuntimeError("真实浏览器已尝试启动，但 http://127.0.0.1:9223 没有就绪。")),
+            "等待登录",
+        )
 
     def test_build_update_fields_does_not_write_empty_caption(self):
         collector = load_collector()
@@ -555,6 +3604,549 @@ class WebhookHelperTests(unittest.TestCase):
         )
 
         self.assertNotIn("文案", fields)
+
+    def test_process_record_waits_for_login_when_only_title_is_available(self):
+        collector = load_collector()
+        updates = []
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+        field_types = {name: 1 for name in collector.DEFAULT_FIELDS.values()}
+
+        collector.extract_from_page = lambda url, cfg: {
+            "source_url": url,
+            "final_url": url,
+            "platform": "抖音",
+            "title": "分享文本里的标题",
+            "caption": "",
+            "cover_url": "",
+            "duration": "01:00",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "",
+        }
+        collector.update_record = lambda cfg, record_id, fields: updates.append(fields)
+        collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(AssertionError("should not transcribe"))
+
+        result = collector.process_record(
+            {"record_id": "rec123", "fields": {"作品链接": "https://www.douyin.com/video/123"}},
+            cfg,
+            field_types,
+            transcribe=True,
+        )
+
+        self.assertEqual(result, "metadata_incomplete")
+        merged = {k: v for update in updates for k, v in update.items()}
+        self.assertEqual(merged["抓取状态"], "等待登录")
+        self.assertIn("未抓到封面", merged["错误信息"])
+        self.assertEqual(merged["文案"], "")
+        self.assertEqual(merged["封面图链接"], "")
+        self.assertEqual(merged["时长"], "")
+        self.assertEqual(merged["发布时间"], "")
+
+    def test_process_record_does_not_downgrade_existing_caption_to_pending(self):
+        collector = load_collector()
+        updates = []
+        cfg = {"fields": collector.DEFAULT_FIELDS}
+        field_types = {name: 1 for name in collector.DEFAULT_FIELDS.values()}
+
+        collector.extract_from_page = lambda url, cfg: {
+            "source_url": url,
+            "final_url": url,
+            "platform": "抖音",
+            "title": "真实标题",
+            "caption": "",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "01:23",
+            "likes": 1,
+            "comments": 2,
+            "shares": 3,
+            "published_at": "2026-06-27 12:00",
+            "media_url": "https://example.com/video.mp4",
+        }
+        collector.update_record = lambda cfg, record_id, fields: updates.append(fields)
+        collector.transcribe_from_meta = lambda cfg, meta: (_ for _ in ()).throw(AssertionError("should not transcribe"))
+        collector.upload_cover_to_feishu = lambda cfg, cover_url, platform: None
+
+        result = collector.process_record(
+            {"record_id": "rec123", "fields": {"作品链接": "https://www.douyin.com/video/123", "文案": "已有逐字稿"}},
+            cfg,
+            field_types,
+            transcribe=False,
+        )
+
+        merged = {k: v for update in updates for k, v in update.items()}
+        self.assertEqual(result, "metadata_synced")
+        self.assertEqual(merged["抓取状态"], "成功")
+
+    def test_douyin_detail_to_meta_extracts_browser_api_payload(self):
+        collector = load_collector()
+
+        meta = collector.douyin_detail_to_meta(
+            "https://www.douyin.com/video/123",
+            "https://www.douyin.com/video/123",
+            {
+                "desc": "第1集｜VibeCoding大赏 #AI教程",
+                "create_time": 1782540050,
+                "statistics": {
+                    "digg_count": 807,
+                    "comment_count": 55,
+                    "share_count": 148,
+                },
+                "video": {
+                    "duration": 528000,
+                    "cover": {"url_list": ["https://example.com/cover.jpg"]},
+                    "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+                },
+            },
+        )
+
+        self.assertEqual(meta["platform"], "抖音")
+        self.assertEqual(meta["content_type"], "video")
+        self.assertEqual(meta["title"], "第1集｜VibeCoding大赏 #AI教程")
+        self.assertEqual(meta["cover_url"], "https://example.com/cover.jpg")
+        self.assertEqual(meta["duration"], "08:48")
+        self.assertEqual(meta["likes"], 807)
+        self.assertEqual(meta["comments"], 55)
+        self.assertEqual(meta["shares"], 148)
+        self.assertEqual(meta["media_url"], "https://example.com/video.mp4")
+
+    def test_visible_published_at_reads_douyin_page_text(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.visible_published_at("举报\\n发布时间：2026-05-14 11:58\\n评论"),
+            "2026-05-14 11:58",
+        )
+
+    def test_douyin_with_only_share_title_still_uses_real_browser(self):
+        collector = load_collector()
+
+        self.assertTrue(
+            collector.should_try_browser_fallback(
+                "抖音",
+                {
+                    "platform": "抖音",
+                    "title": "分享文本里的标题",
+                    "caption": "",
+                    "cover_url": "",
+                    "likes": None,
+                    "comments": None,
+                    "shares": None,
+                    "media_url": "",
+                },
+            )
+        )
+
+    def test_douyin_uses_browser_api_before_opening_real_page(self):
+        collector = load_collector()
+        calls = []
+
+        collector.detect_platform = lambda url: "抖音"
+        collector.extract_douyin_api = lambda url, cfg: {}
+        collector.fetch_text = lambda url, cfg, platform: ("<html></html>", "https://www.douyin.com/video/123")
+        collector.extract_from_html = lambda url, text, final_url, platform: {
+            "source_url": url,
+            "final_url": final_url,
+            "platform": platform,
+            "title": "分享文本标题",
+            "caption": "",
+            "cover_url": "",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "",
+        }
+        collector.extract_douyin_with_browser_api = lambda url, cfg: {
+            "source_url": url,
+            "final_url": url,
+            "platform": "抖音",
+            "title": "浏览器接口标题",
+            "caption": "",
+            "cover_url": "https://example.com/cover.jpg",
+            "duration": "01:23",
+            "likes": 1,
+            "comments": 2,
+            "shares": 3,
+            "published_at": "2026-06-27 12:00",
+            "media_url": "https://example.com/video.mp4",
+        }
+
+        def fake_real_browser(url, cfg):
+            calls.append(url)
+            raise AssertionError("should not open target page when browser api has enough data")
+
+        collector.extract_with_real_browser = fake_real_browser
+
+        meta = collector.extract_from_page("https://v.douyin.com/abc/", {"browser_fallback": {"enabled": True}})
+
+        self.assertEqual(calls, [])
+        self.assertEqual(meta["cover_url"], "https://example.com/cover.jpg")
+        self.assertEqual(meta["media_url"], "https://example.com/video.mp4")
+        self.assertEqual(meta["likes"], 1)
+
+    def test_usable_browser_title_rejects_edge_placeholder_titles(self):
+        collector = load_collector()
+
+        self.assertEqual(collector.usable_browser_title("PC Tab"), "")
+        self.assertEqual(collector.usable_browser_title("开启读屏标签"), "")
+        self.assertEqual(collector.usable_browser_title("视频数据加载中"), "")
+        self.assertEqual(collector.usable_browser_title("2026 ©"), "")
+        self.assertEqual(collector.usable_browser_title("00:01 / 03:01"), "")
+        self.assertEqual(collector.usable_browser_title("京ICP备16016397号-3"), "")
+        self.assertEqual(collector.usable_browser_title("安全验证"), "")
+        self.assertEqual(collector.usable_browser_title("真实作品标题"), "真实作品标题")
+
+    def test_extract_from_html_does_not_keep_pc_tab_as_title(self):
+        collector = load_collector()
+
+        meta = collector.extract_from_html(
+            "https://www.douyin.com/video/123",
+            "<html><head><title>PC Tab</title></head><body></body></html>",
+            "https://www.douyin.com/video/123",
+            "抖音",
+        )
+
+        self.assertEqual(meta["title"], "")
+
+    def test_extract_from_html_does_not_keep_subtitle_config_as_caption(self):
+        collector = load_collector()
+
+        meta = collector.extract_from_html(
+            "https://www.douyin.com/video/123",
+            "<script>{\"captionText\":{\"cache_switch\":false,\"language_list\":[{\"language_code\":\"zh-Hans-CN\"}]}}</script>",
+            "https://www.douyin.com/video/123",
+            "抖音",
+        )
+
+        self.assertEqual(meta["caption"], "")
+
+    def test_browser_fallback_uses_cdp_defaults(self):
+        collector = load_collector()
+        cfg = {"browser_fallback": {}}
+
+        fallback_cfg = collector.browser_fallback_config(cfg)
+
+        self.assertEqual(fallback_cfg["remote_debugging_port"], 9223)
+        self.assertTrue(fallback_cfg["keep_open"])
+        self.assertIn("browser-profile-cdp", fallback_cfg["profile_dir"])
+
+    def test_cdp_endpoint_uses_configured_port(self):
+        collector = load_collector()
+
+        self.assertEqual(
+            collector.cdp_endpoint({"remote_debugging_port": 9333}),
+            "http://127.0.0.1:9333",
+        )
+
+    def test_connect_cdp_browser_uses_short_timeout(self):
+        collector = load_collector()
+        calls = []
+
+        class Chromium:
+            def connect_over_cdp(self, endpoint, **kwargs):
+                calls.append((endpoint, kwargs))
+                return "browser"
+
+        class Playwright:
+            chromium = Chromium()
+
+        result = collector.connect_cdp_browser(
+            Playwright(),
+            {"remote_debugging_port": 9333, "timeout": 60},
+        )
+
+        self.assertEqual(result, "browser")
+        self.assertEqual(calls[0][0], "http://127.0.0.1:9333")
+        self.assertLessEqual(calls[0][1]["timeout"], 10000)
+
+    def test_connect_cdp_browser_with_recovery_relaunches_once(self):
+        collector = load_collector()
+        calls = []
+
+        class Playwright:
+            pass
+
+        def fake_connect(playwright, fallback_cfg):
+            calls.append("connect")
+            if calls.count("connect") == 1:
+                raise RuntimeError("connection refused")
+            return "browser"
+
+        collector.connect_cdp_browser = fake_connect
+        collector.stop_cdp_browser = lambda fallback_cfg: calls.append("stop")
+        collector.launch_cdp_browser = lambda fallback_cfg, start_url="about:blank": calls.append(("launch", start_url))
+
+        result = collector.connect_cdp_browser_with_recovery(Playwright(), {}, "抖音")
+
+        self.assertEqual(result, "browser")
+        self.assertEqual(calls, ["connect", "stop", ("launch", "https://www.douyin.com/"), "connect"])
+
+    def test_cdp_launch_command_runs_browser_binary_directly(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+            cfg = {
+                "executable_path": str(executable),
+                "profile_dir": str(Path(tmp) / "profile"),
+                "remote_debugging_port": 9444,
+            }
+
+            cmd = collector.cdp_browser_launch_command(cfg, "https://www.douyin.com/")
+
+            self.assertEqual(cmd[0], str(executable))
+            self.assertIn("--remote-debugging-port=9444", cmd)
+            self.assertIn("https://www.douyin.com/", cmd)
+
+    def test_douyin_falls_back_to_real_browser_when_ytdlp_needs_fresh_cookies(self):
+        collector = load_collector()
+        calls = []
+
+        collector.detect_platform = lambda url: "抖音"
+        collector.extract_douyin_api = lambda url, cfg: {}
+        collector.extract_douyin_with_browser_api = lambda url, cfg: {}
+        collector.fetch_text = lambda url, cfg, platform: ("<html></html>", url)
+        collector.extract_from_html = lambda url, text, final_url, platform: {
+            "source_url": url,
+            "final_url": final_url,
+            "platform": platform,
+            "title": "",
+            "caption": "",
+            "cover_url": "",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+        }
+        collector.extract_with_ytdlp = lambda url, cfg: (_ for _ in ()).throw(RuntimeError("Fresh cookies are needed"))
+
+        def fake_browser(url, cfg):
+            calls.append(url)
+            return {
+                "source_url": url,
+                "final_url": url,
+                "platform": "抖音",
+                "title": "真实浏览器标题",
+                "caption": "",
+                "cover_url": "https://example.com/cover.jpg",
+                "duration": "",
+                "likes": 807,
+                "comments": 55,
+                "shares": 148,
+                "published_at": "",
+                "media_url": "https://example.com/video.mp4",
+            }
+
+        collector.extract_with_real_browser = fake_browser
+
+        meta = collector.extract_from_page("https://www.douyin.com/video/123", {"browser_fallback": {"enabled": True}})
+
+        self.assertEqual(calls, ["https://www.douyin.com/video/123"])
+        self.assertEqual(meta["title"], "真实浏览器标题")
+        self.assertEqual(meta["cover_url"], "https://example.com/cover.jpg")
+        self.assertEqual(meta["media_url"], "https://example.com/video.mp4")
+
+    def test_douyin_browser_detail_retries_until_api_is_ready(self):
+        collector = load_collector()
+
+        class Page:
+            def __init__(self):
+                self.calls = 0
+                self.waits = []
+
+            def evaluate(self, script, aweme_id):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"__status": 403}
+                if self.calls == 2:
+                    return {}
+                return {
+                    "aweme_detail": {
+                        "desc": "登录后可见标题",
+                        "create_time": 1783437900,
+                        "statistics": {"digg_count": 576, "comment_count": 51, "share_count": 259},
+                        "video": {
+                            "duration": 134000,
+                            "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+                            "cover": {"url_list": ["https://example.com/cover.jpg"]},
+                        },
+                    }
+                }
+
+            def wait_for_timeout(self, ms):
+                self.waits.append(ms)
+
+        page = Page()
+
+        detail = collector.fetch_douyin_detail_from_browser_page(page, "7535823852908121353", attempts=4, wait_ms=100)
+
+        self.assertEqual(detail["desc"], "登录后可见标题")
+        self.assertEqual(page.calls, 3)
+        self.assertEqual(page.waits, [100, 200])
+
+    def test_douyin_signed_365yg_media_url_is_valid_video_url(self):
+        collector = load_collector()
+        url = (
+            "https://v5-se-ex-mc-default.365yg.com/c2abee/video/tos/cn/example/"
+            "?mime_type=video_mp4&dy_q=1783442803"
+        )
+
+        self.assertEqual(collector.media_url_or_empty({"media_url": url}), url)
+
+    def test_douyin_share_url_canonicalizes_to_web_video_url(self):
+        collector = load_collector()
+        url = "https://www.iesdouyin.com/share/video/7658258510953822117/?from=web_code_link"
+
+        self.assertEqual(
+            collector.canonical_douyin_video_url(url),
+            "https://www.douyin.com/video/7658258510953822117",
+        )
+
+    def test_read_page_content_retries_while_page_is_navigating(self):
+        collector = load_collector()
+
+        class Page:
+            attempts = 0
+
+            def content(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("Page.content: Unable to retrieve content because the page is navigating")
+                return "<html>ready</html>"
+
+            def wait_for_timeout(self, ms):
+                self.waited = ms
+
+        page = Page()
+
+        self.assertEqual(collector.read_page_content_with_retry(page, attempts=2), "<html>ready</html>")
+        self.assertEqual(page.attempts, 2)
+
+    def test_xiaohongshu_uses_real_browser_when_page_metadata_is_incomplete(self):
+        collector = load_collector()
+        calls = []
+
+        collector.detect_platform = lambda url: "小红书"
+        collector.fetch_text = lambda url, cfg, platform: ("<html></html>", url)
+        collector.extract_from_html = lambda url, text, final_url, platform: {
+            "source_url": url,
+            "final_url": final_url,
+            "platform": platform,
+            "content_type": "video",
+            "title": "",
+            "caption": "",
+            "cover_url": "",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "",
+        }
+        collector.extract_xiaohongshu_with_browser_fetch = lambda url, cfg: {}
+
+        def fake_browser(url, cfg):
+            calls.append(url)
+            return {
+                "source_url": url,
+                "final_url": url,
+                "platform": "小红书",
+                "content_type": "video",
+                "title": "小红书真实标题",
+                "caption": "",
+                "cover_url": "https://example.com/xhs.jpg",
+                "duration": "00:12",
+                "likes": 12,
+                "comments": 3,
+                "shares": 1,
+                "published_at": "2026年01月01日00时00分00秒",
+                "media_url": "https://example.com/xhs.mp4",
+            }
+
+        collector.extract_with_real_browser = fake_browser
+
+        meta = collector.extract_from_page("https://www.xiaohongshu.com/explore/abc", {"browser_fallback": {"enabled": True}})
+
+        self.assertEqual(calls, ["https://www.xiaohongshu.com/explore/abc"])
+        self.assertEqual(meta["title"], "小红书真实标题")
+        self.assertEqual(meta["media_url"], "https://example.com/xhs.mp4")
+
+    def test_xiaohongshu_title_only_still_needs_browser_fallback(self):
+        collector = load_collector()
+
+        self.assertTrue(
+            collector.should_try_browser_fallback(
+                "小红书",
+                {
+                    "platform": "小红书",
+                    "content_type": "video",
+                    "title": "小红书标题",
+                    "caption": "",
+                    "cover_url": "",
+                    "duration": "",
+                    "likes": None,
+                    "comments": None,
+                    "shares": None,
+                    "published_at": "",
+                    "media_url": "",
+                },
+            )
+        )
+
+    def test_xiaohongshu_uses_browser_fetch_before_opening_real_page(self):
+        collector = load_collector()
+        real_browser_calls = []
+
+        collector.detect_platform = lambda url: "小红书"
+        collector.fetch_text = lambda url, cfg, platform: ("<html><title>小红书标题</title></html>", url)
+        collector.extract_from_html = lambda url, text, final_url, platform: {
+            "source_url": url,
+            "final_url": final_url,
+            "platform": platform,
+            "content_type": "video",
+            "title": "小红书标题",
+            "caption": "",
+            "cover_url": "",
+            "duration": "",
+            "likes": None,
+            "comments": None,
+            "shares": None,
+            "published_at": "",
+            "media_url": "",
+        }
+        collector.extract_xiaohongshu_with_browser_fetch = lambda url, cfg: {
+            "source_url": url,
+            "final_url": url,
+            "platform": "小红书",
+            "content_type": "video",
+            "title": "浏览器登录态标题",
+            "caption": "",
+            "cover_url": "https://example.com/xhs-cover.jpg",
+            "duration": "00:45",
+            "likes": 10,
+            "comments": 2,
+            "shares": 1,
+            "published_at": "2026年06月27日12时00分00秒",
+            "media_url": "https://example.com/xhs-video.mp4",
+        }
+
+        def fake_real_browser(url, cfg):
+            real_browser_calls.append(url)
+            raise AssertionError("should not open target page when browser fetch has enough data")
+
+        collector.extract_with_real_browser = fake_real_browser
+
+        meta = collector.extract_from_page("https://www.xiaohongshu.com/explore/abc", {"browser_fallback": {"enabled": True}})
+
+        self.assertEqual(real_browser_calls, [])
+        self.assertEqual(meta["cover_url"], "https://example.com/xhs-cover.jpg")
+        self.assertEqual(meta["media_url"], "https://example.com/xhs-video.mp4")
+        self.assertEqual(meta["likes"], 10)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+#!/bin/zsh
+set -e
+
+COLLECTOR_DIR="/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器"
+URL="http://127.0.0.1:51216/"
+
+if /usr/bin/curl -fsS "${URL}api/health" >/dev/null 2>&1; then
+  /usr/bin/open "$URL"
+  exit 0
+fi
+
+cd "$COLLECTOR_DIR"
+/usr/bin/open "$URL"
+exec /usr/bin/python3 content_link_collector.py desktop-app --host 127.0.0.1 --port 51216

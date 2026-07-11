@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.chen.content-link-collector.health</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/content_link_collector.py</string>
+    <string>health-daemon</string>
+    <string>--interval</string>
+    <string>86400</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/chen.zip/.local/bin:/Users/chen.zip/Library/Python/3.9/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/logs/health.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/logs/health.err.log</string>
+</dict>
+</plist>

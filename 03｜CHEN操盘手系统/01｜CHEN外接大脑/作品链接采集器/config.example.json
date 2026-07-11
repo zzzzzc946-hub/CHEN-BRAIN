@@ -41,5 +41,39 @@
     "encrypt_key": "",
     "verification_token": "",
     "scan_interval": 15
+  },
+  "login_gate": {
+    "enabled": true,
+    "retry_interval": 30,
+    "max_retry_attempts": 20,
+    "open_cooldown": 300
+  },
+  "yt_dlp": {
+    "enabled": true,
+    "cookies_file": "cookies.txt",
+    "cookies_from_browser": "",
+    "proxy": "",
+    "extractor_args": [],
+    "js_runtimes": "",
+    "youtube_retry_extractor_args": [
+      "youtube:player_client=mweb",
+      "youtube:player_client=web_safari",
+      "youtube:player_client=ios",
+      "youtube:player_client=android",
+      "youtube:player_client=tv"
+    ],
+    "youtube_po_token": "",
+    "youtube_po_token_provider": false,
+    "download_format": "ba[ext=m4a]/ba/best[ext=mp4][height<=360]/18/best[height<=360]/best"
+  },
+  "youtube_safety": {
+    "enabled": true,
+    "preflight": true,
+    "connectivity_check": false,
+    "connectivity_url": "https://www.youtube.com/generate_204",
+    "throttle_seconds": 3.0,
+    "max_consecutive_network_failures": 2,
+    "open_browser_before_scrape": true,
+    "browser_gate_timeout": 12
   }
 }

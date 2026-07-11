@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.chen.content-link-collector.desktop-app</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector/content_link_collector.py</string>
+    <string>desktop-app</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>51216</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/chen.zip/Library/Application Support/ChenContentLinkCollector</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/chen-content-collector-app.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/chen-content-collector-app.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
