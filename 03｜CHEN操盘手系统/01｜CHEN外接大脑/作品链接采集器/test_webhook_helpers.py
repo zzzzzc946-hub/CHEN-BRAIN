@@ -425,6 +425,19 @@ class WebhookHelperTests(unittest.TestCase):
                 {
                     "fields": {
                         "作品链接": "https://www.douyin.com/video/123456789",
+                        "抓取状态": "浏览器未就绪",
+                        "抓取时间": "2026-06-27 10:00:00",
+                    }
+                },
+                cfg,
+                now=collector.dt.datetime(2026, 6, 27, 10, 4, 0),
+            )
+        )
+        self.assertTrue(
+            collector.should_process_blank_record(
+                {
+                    "fields": {
+                        "作品链接": "https://www.douyin.com/video/123456789",
                         "作品标题": "已有标题",
                         "抓取状态": "待转写",
                     }
@@ -706,66 +719,6 @@ class WebhookHelperTests(unittest.TestCase):
             self.assertEqual(updated["likes"], 12)
             self.assertEqual(updated["source_url"], "https://www.douyin.com/video/edit-me")
 
-    def test_desktop_update_item_accepts_daily_fields(self):
-        collector = load_collector()
-        with tempfile.TemporaryDirectory() as tmp:
-            db = Path(tmp) / "desktop.sqlite3"
-            collector.desktop_db_init(db)
-            table = collector.desktop_list_tables(db)[0]
-            saved = collector.desktop_save_item(
-                db,
-                table["id"],
-                {
-                    "platform": "抖音",
-                    "source_url": "https://www.douyin.com/video/daily-me",
-                    "source_type": "single",
-                    "title": "日报素材",
-                    "raw_metadata_json": "{}",
-                },
-            )
-
-            updated = collector.desktop_update_item(
-                db,
-                saved["id"],
-                {
-                    "daily_selected": True,
-                    "daily_date": "2026-07-09",
-                    "daily_sort": "42",
-                    "max_daily_card": "口喷卡片",
-                    "max_feedback": "可讲",
-                },
-            )
-
-            self.assertEqual(updated["daily_selected"], 1)
-            self.assertEqual(updated["daily_date"], "2026-07-09")
-            self.assertEqual(updated["daily_sort"], 42)
-            self.assertEqual(updated["max_daily_card"], "口喷卡片")
-            self.assertEqual(updated["max_feedback"], "可讲")
-
-    def test_desktop_daily_payload_includes_history_dates(self):
-        collector = load_collector()
-        with tempfile.TemporaryDirectory() as tmp:
-            db = Path(tmp) / "desktop.sqlite3"
-            collector.desktop_db_init(db)
-            table = collector.desktop_list_tables(db)[0]
-            first = collector.desktop_save_item(
-                db,
-                table["id"],
-                {"platform": "抖音", "source_url": "https://a.example/1", "source_type": "single", "title": "昨天", "raw_metadata_json": "{}"},
-            )
-            second = collector.desktop_save_item(
-                db,
-                table["id"],
-                {"platform": "抖音", "source_url": "https://a.example/2", "source_type": "single", "title": "今天", "raw_metadata_json": "{}"},
-            )
-            collector.desktop_update_item(db, first["id"], {"daily_selected": True, "daily_date": "2026-07-08", "daily_sort": 1})
-            collector.desktop_update_item(db, second["id"], {"daily_selected": True, "daily_date": "2026-07-09", "daily_sort": 1})
-
-            payload = collector.desktop_daily_payload(db, "")
-
-            self.assertEqual(payload["date"], "2026-07-09")
-            self.assertEqual([d["date"] for d in payload["dates"]], ["2026-07-09", "2026-07-08"])
-
     def test_desktop_save_cover_file_writes_file(self):
         collector = load_collector()
         original_fetch_binary = collector.fetch_binary
@@ -1042,6 +995,261 @@ class WebhookHelperTests(unittest.TestCase):
             self.assertEqual(saved.suffix, ".md")
             self.assertTrue(saved.exists())
             self.assertIn("CHEN 内容采集表", saved.read_text(encoding="utf-8"))
+
+    def test_desktop_max_daily_export_is_ready_for_max_review(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.desktop_rename_table(db, table["id"], "日报素材表")
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/max-daily",
+                    "source_type": "single",
+                    "title": "Max要看的标题",
+                    "caption": "这是一段可以交给 Max 判断切入点的逐字稿。",
+                    "likes": 1200,
+                    "comments": 34,
+                    "shares": 56,
+                    "status": "成功",
+                    "error": "",
+                    "raw_metadata_json": "{}",
+                },
+            )
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "小红书",
+                    "source_url": "https://www.xiaohongshu.com/explore/wait",
+                    "source_type": "single",
+                    "title": "待处理标题",
+                    "status": "需登录",
+                    "error": "需要登录后重试",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            data, content_type, ext = collector.desktop_export_bytes(db, table["id"], "max-daily")
+            text = data.decode("utf-8")
+
+            self.assertEqual(content_type, "text/markdown; charset=utf-8")
+            self.assertEqual(ext, ".md")
+            self.assertIn("# MAX 日报", text)
+            self.assertIn("采集表：日报素材表", text)
+            self.assertIn("## 给 Max 的阅读顺序", text)
+            self.assertIn("Max要看的标题", text)
+            self.assertIn("这是一段可以交给 Max 判断切入点的逐字稿。", text)
+            self.assertIn("## 需要补救的素材", text)
+            self.assertIn("需要登录后重试", text)
+
+    def test_desktop_max_daily_save_uses_readable_filename(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            target = Path(tmp) / "今天给Max"
+
+            result = collector.desktop_save_export_file(db, table["id"], "max-daily", target)
+
+            saved = Path(result["path"])
+            self.assertEqual(saved.suffix, ".md")
+            self.assertTrue(saved.exists())
+            self.assertIn("MAX 日报", saved.read_text(encoding="utf-8"))
+
+    def test_desktop_daily_report_generates_editable_web_report(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            collector.desktop_rename_table(db, table["id"], "外部情报素材")
+            collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/oral-daily",
+                    "source_type": "single",
+                    "title": "外部情报标题",
+                    "caption": "这是一条适合 Max 口喷的外部情报。",
+                    "likes": 30,
+                    "comments": 4,
+                    "shares": 2,
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            report = collector.desktop_get_daily_report(db, table["id"])
+
+            self.assertEqual(report["title"], "外部情报口喷日报")
+            self.assertEqual(report["table_name"], "外部情报素材")
+            self.assertIn("外部情报标题", report["body"])
+            self.assertIn("这是一条适合 Max 口喷的外部情报。", report["body"])
+            self.assertEqual(report["url"], f"/daily?table_id={table['id']}")
+
+    def test_desktop_daily_report_saves_max_edits(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+
+            saved = collector.desktop_save_daily_report(
+                db,
+                table["id"],
+                "Max改过的标题",
+                "Max 在网页里编辑后的正文。",
+            )
+            loaded = collector.desktop_get_daily_report(db, table["id"])
+
+            self.assertEqual(saved["title"], "Max改过的标题")
+            self.assertEqual(loaded["title"], "Max改过的标题")
+            self.assertEqual(loaded["body"], "Max 在网页里编辑后的正文。")
+            self.assertTrue(loaded["updated_at"])
+
+    def test_desktop_daily_columns_and_card_workflow_are_restored(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/daily-card",
+                    "source_type": "single",
+                    "title": "外部情报标题",
+                    "caption": "外部情报逐字稿",
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            added = collector.desktop_daily_add_items(db, table["id"], [saved["id"]], "2026-07-09")
+            cards = collector.desktop_daily_cards(db, table["id"], "2026-07-09")
+
+            self.assertEqual(added["count"], 1)
+            self.assertEqual(cards[0]["id"], saved["id"])
+            self.assertEqual(cards[0]["daily_selected"], 1)
+            self.assertEqual(cards[0]["daily_date"], "2026-07-09")
+            self.assertIn("外部情报标题", cards[0]["max_daily_card"])
+            self.assertIn("外部情报逐字稿", cards[0]["max_daily_card"])
+
+            updated = collector.desktop_daily_update_card(
+                db,
+                saved["id"],
+                {"max_daily_card": "Max 改过的口喷卡片", "max_feedback": "已看"},
+            )
+            self.assertEqual(updated["max_daily_card"], "Max 改过的口喷卡片")
+            self.assertEqual(updated["max_feedback"], "已看")
+
+            removed = collector.desktop_daily_remove_items(db, [saved["id"]])
+            self.assertEqual(removed["count"], 1)
+            self.assertEqual(collector.desktop_daily_cards(db, table["id"], "2026-07-09"), [])
+
+    def test_desktop_html_restores_daily_buttons_and_card_table_names(self):
+        collector = load_collector()
+
+        self.assertIn("录入日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("删除日报", collector.DESKTOP_APP_HTML)
+        self.assertIn("外部情报口喷卡片", collector.DESKTOP_DAILY_HTML)
+        self.assertIn("/api/daily", collector.DESKTOP_DAILY_HTML)
+
+    def test_desktop_daily_page_restores_rich_internal_workbench(self):
+        collector = load_collector()
+
+        html = collector.DESKTOP_DAILY_HTML
+        self.assertIn("MAX DAILY INTEL", html)
+        self.assertIn("外部情报口喷日报", html)
+        self.assertIn('aria-label="日报视图工具栏"', html)
+        self.assertIn("视频专注", html)
+        self.assertIn("文稿阅读", html)
+        self.assertIn("表格总览", html)
+        self.assertIn("字段配置", html)
+        self.assertIn("调整空间", html)
+        self.assertIn("spaceRange", html)
+        self.assertIn("type=\"range\"", html)
+        self.assertIn("@keyframes dailyFloat", html)
+        self.assertIn("particleCanvas", html)
+        self.assertIn("startParticles", html)
+        self.assertIn("timelineDrawer", html)
+        self.assertIn("renderTimeline", html)
+        self.assertIn("bindSpringSlider", html)
+        self.assertIn("cubic-bezier(.18,.89,.32,1.28)", html)
+        self.assertIn("MAX口喷卡片", html)
+        self.assertIn("返回采集助手", html)
+
+    def test_desktop_daily_actions_live_on_each_row_with_manual_oral_card_column(self):
+        collector = load_collector()
+
+        self.assertIn("'口喷日报'", collector.DESKTOP_APP_HTML)
+        self.assertIn("'max_daily_card'", collector.DESKTOP_APP_HTML)
+        self.assertIn("addRowToDaily", collector.DESKTOP_APP_HTML)
+        self.assertIn("removeRowFromDaily", collector.DESKTOP_APP_HTML)
+        self.assertNotIn('onclick="addSelectedToDaily()">录入日报', collector.DESKTOP_APP_HTML)
+        self.assertNotIn('onclick="removeSelectedFromDaily()">删除日报', collector.DESKTOP_APP_HTML)
+
+    def test_desktop_daily_entry_is_prominent_and_opens_without_selected_table(self):
+        collector = load_collector()
+        html = collector.DESKTOP_APP_HTML
+
+        self.assertIn("打开外部情报口喷日报", html)
+        self.assertIn("daily-hero-btn", html)
+        self.assertIn("const path=state.tableId?'/daily?table_id='", html)
+        self.assertIn(":'/daily'", html)
+        self.assertIn("window.location.href=path", html)
+        open_daily = html.split("function openDailyPage()", 1)[1].split("async function openCoverOriginal", 1)[0]
+        self.assertNotIn("请先选择或新建采集表", open_daily)
+
+    def test_desktop_manual_oral_daily_card_can_be_saved_from_table_cell(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            saved = collector.desktop_save_item(
+                db,
+                table["id"],
+                {
+                    "platform": "抖音",
+                    "source_url": "https://www.douyin.com/video/manual-card",
+                    "source_type": "single",
+                    "title": "手填卡片素材",
+                    "status": "成功",
+                    "raw_metadata_json": "{}",
+                },
+            )
+
+            updated = collector.desktop_update_item(db, saved["id"], {"max_daily_card": "我手动填的口喷日报"})
+
+            self.assertEqual(updated["max_daily_card"], "我手动填的口喷日报")
+            self.assertEqual(collector.desktop_get_item(db, saved["id"])["max_daily_card"], "我手动填的口喷日报")
+
+    def test_desktop_daily_summary_defaults_to_latest_daily_date(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "desktop.sqlite3"
+            collector.desktop_db_init(db)
+            table = collector.desktop_list_tables(db)[0]
+            first = collector.desktop_save_item(db, table["id"], {"source_url": "https://a.example/1", "title": "旧日报", "raw_metadata_json": "{}"})
+            second = collector.desktop_save_item(db, table["id"], {"source_url": "https://a.example/2", "title": "新日报", "raw_metadata_json": "{}"})
+            collector.desktop_daily_add_items(db, table["id"], [first["id"]], "2026-07-08")
+            collector.desktop_daily_add_items(db, table["id"], [second["id"]], "2026-07-10")
+
+            summary = collector.desktop_daily_summary(db, table["id"], "")
+
+            self.assertEqual(summary["date"], "2026-07-10")
+            self.assertEqual(summary["count"], 1)
+            self.assertEqual(summary["items"][0]["title"], "新日报")
 
     def test_douyin_profile_entries_extract_unique_video_links(self):
         collector = load_collector()
@@ -1335,19 +1543,6 @@ class WebhookHelperTests(unittest.TestCase):
         self.assertIn("selected-count", collector.DESKTOP_APP_HTML)
         self.assertIn("table-toolbar-panel", collector.DESKTOP_APP_HTML)
 
-    def test_desktop_app_daily_fields_wrap_in_bitable_cells(self):
-        collector = load_collector()
-
-        self.assertIn("const multilineFields=new Set", collector.DESKTOP_APP_HTML)
-        for field in ("caption", "error", "title", "max_daily_card", "max_feedback", "daily_date"):
-            self.assertIn(f"'{field}'", collector.DESKTOP_APP_HTML)
-        self.assertIn("white-space:pre-wrap", collector.DESKTOP_APP_HTML)
-        self.assertIn("overflow-wrap:anywhere", collector.DESKTOP_APP_HTML)
-        self.assertIn("word-break:break-word", collector.DESKTOP_APP_HTML)
-        self.assertIn("function tableWidthClass()", collector.DESKTOP_APP_HTML)
-        self.assertIn("table-fit-panel", collector.DESKTOP_APP_HTML)
-        self.assertIn("visibleColumns().length<=4", collector.DESKTOP_APP_HTML)
-
     def test_desktop_app_table_toolbar_has_clear_bitable_layout(self):
         collector = load_collector()
 
@@ -1357,220 +1552,6 @@ class WebhookHelperTests(unittest.TestCase):
         self.assertIn("bitable-toolbar", collector.DESKTOP_APP_HTML)
         self.assertIn("toolbar-group", collector.DESKTOP_APP_HTML)
         self.assertIn("toolbar-spacer", collector.DESKTOP_APP_HTML)
-
-    def test_desktop_app_restores_daily_entry_points(self):
-        collector = load_collector()
-
-        self.assertIn("打开今日日报", collector.DESKTOP_APP_HTML)
-        self.assertIn("MAX口喷日报", collector.DESKTOP_APP_HTML)
-        self.assertIn("daily-hero-btn", collector.DESKTOP_APP_HTML)
-        self.assertIn("日报日期", collector.DESKTOP_APP_HTML)
-        self.assertIn("录入日报", collector.DESKTOP_APP_HTML)
-        self.assertIn("删除日报", collector.DESKTOP_APP_HTML)
-        self.assertIn("已录入", collector.DESKTOP_APP_HTML)
-        self.assertIn("function openDailyPage()", collector.DESKTOP_APP_HTML)
-        self.assertIn("window.location.href=dailyPageUrl()", collector.DESKTOP_APP_HTML)
-        self.assertIn("function toggleDaily(id,force)", collector.DESKTOP_APP_HTML)
-        self.assertIn("function dailyDateHtml(i)", collector.DESKTOP_APP_HTML)
-        self.assertIn("function dailyActionHtml(i)", collector.DESKTOP_APP_HTML)
-        self.assertIn("打开登录浏览器", collector.DESKTOP_APP_HTML)
-        self.assertIn("/api/browser/login", collector.DESKTOP_APP_HTML)
-        self.assertIn("daily_selected", collector.DESKTOP_APP_HTML)
-        self.assertIn("daily_date", collector.DESKTOP_APP_HTML)
-        self.assertIn("/daily?date=", collector.DESKTOP_APP_HTML)
-        self.assertIn("返回采集助手", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("日报时间轴", collector.DESKTOP_DAILY_HTML)
-        for label in ("工作台", "视频专注", "文稿阅读", "表格总览", "调整空间"):
-            self.assertIn(label, collector.DESKTOP_DAILY_HTML)
-        self.assertIn("dates=data.dates", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("toggleTimeline()", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("timelinePopover", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("function setDailyView(view)", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("function toggleTool(tool)", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("function setDensity(value)", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("dailyDrift", collector.DESKTOP_DAILY_HTML)
-        self.assertIn("<aside class=\"panel side\"><h2>当天素材</h2>", collector.DESKTOP_DAILY_HTML)
-        self.assertNotIn("onclick=\"location.href='/daily'\">日报时间轴", collector.DESKTOP_DAILY_HTML)
-
-    def test_desktop_app_home_hero_keeps_daily_entry_button(self):
-        collector = load_collector()
-
-        html = collector.DESKTOP_APP_HTML
-        hero_start = html.index("<section class=\"hero\">")
-        hero_end = html.index("<section class=\"platforms\"", hero_start)
-        hero_html = html[hero_start:hero_end]
-        self.assertIn("MAX口喷日报", hero_html)
-        self.assertIn("daily-hero-btn", hero_html)
-        self.assertIn("onclick=\"openDailyPage()\"", hero_html)
-        self.assertIn(".daily-hero-btn{min-height:54px;padding:0 24px;border-radius:14px;background:linear-gradient(135deg,#ffd36b,var(--orange))", html)
-        self.assertNotIn(".daily-hero-btn{min-height:54px;padding:0 24px;border-radius:14px;background:linear-gradient(135deg,#45a9ff,#7cc7ff)", html)
-
-    def test_desktop_app_daily_action_is_stateful(self):
-        collector = load_collector()
-
-        html = collector.DESKTOP_APP_HTML
-        self.assertIn("function dailyActionHtml(i)", html)
-        self.assertIn("Number(i.daily_selected||0)", html)
-        self.assertIn("toggleDaily('${id}',1)", html)
-        self.assertIn("toggleDaily('${id}',0)", html)
-        self.assertIn("已录入 ${date}", html)
-        self.assertIn("daily_date:next?todayText():''", html)
-        self.assertIn("daily_sort:next?Date.now():0", html)
-        self.assertNotIn("const dailyLabel=dailyOn?'移出今日日报':'加入今日日报'", html)
-
-    def test_desktop_engine_status_tracks_all_platforms(self):
-        collector = load_collector()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "collector.db"
-            table = collector.desktop_create_table(db_path, "平台状态测试", "抖音")
-            collector.desktop_save_item(
-                db_path,
-                table["id"],
-                {
-                    "platform": "小红书",
-                    "source_url": "https://www.xiaohongshu.com/explore/abc",
-                    "source_type": "single",
-                    "status": "需登录",
-                },
-            )
-            collector.desktop_save_item(
-                db_path,
-                table["id"],
-                {
-                    "platform": "",
-                    "source_url": "https://www.youtube.com/watch?v=abc123",
-                    "source_type": "single",
-                    "status": "等待登录",
-                },
-            )
-            collector.cdp_browser_available = lambda cfg: False
-            collector.pmset_power_summary = lambda: {"source": "AC Power"}
-            collector.launchctl_label_running = lambda label: False
-
-            status = collector.desktop_engine_status(db_path, {"browser_fallback": {"enabled": True}})
-
-        platform_rows = {row["platform"]: row for row in status["platform_statuses"]}
-        self.assertEqual(list(platform_rows), collector.DESKTOP_ENGINE_PLATFORMS)
-        self.assertEqual(platform_rows["小红书"]["waiting_login_count"], 1)
-        self.assertEqual(platform_rows["小红书"]["status"], "需要登录")
-        self.assertEqual(platform_rows["YouTube"]["waiting_login_count"], 1)
-        self.assertEqual(platform_rows["YouTube"]["status"], "需要登录")
-        self.assertEqual(platform_rows["抖音"]["status"], "浏览器未连接")
-        self.assertEqual(platform_rows["Instagram"]["login_url"], "https://www.instagram.com/")
-
-    def test_desktop_app_engine_card_has_all_platform_controls(self):
-        collector = load_collector()
-
-        self.assertIn("engine-card compact", collector.DESKTOP_APP_HTML)
-        self.assertIn("engine-compact-summary", collector.DESKTOP_APP_HTML)
-        self.assertIn("engine-status-popover", collector.DESKTOP_APP_HTML)
-        self.assertIn("function toggleEngineStatusPanel(force)", collector.DESKTOP_APP_HTML)
-        self.assertIn("engine-platform-grid", collector.DESKTOP_APP_HTML)
-        self.assertIn("function platformStatusHtml(rows)", collector.DESKTOP_APP_HTML)
-        self.assertIn("function platformTone(row)", collector.DESKTOP_APP_HTML)
-        self.assertIn("function openLoginBrowser(platform)", collector.DESKTOP_APP_HTML)
-        for platform in collector.DESKTOP_ENGINE_PLATFORMS:
-            self.assertIn(f"打开{platform}登录浏览器", collector.DESKTOP_APP_HTML)
-            self.assertIn(f"openLoginBrowser('{platform}')", collector.DESKTOP_APP_HTML)
-
-    def test_regression_guardrail_keeps_daily_workbench_contract(self):
-        collector = load_collector()
-
-        required_daily_markers = [
-            "dailyParticleCanvas",
-            "dailyColumns",
-            "setFieldPreset",
-            "setFieldVisible",
-            "function renderTable(list)",
-            "function setFilter(k,v)",
-            "function setSort(field,dir)",
-            "function setDailyView(view)",
-            "function toggleTimeline(force)",
-            "timelinePopover",
-            "表格总览",
-            "字段配置",
-            "筛选",
-            "排序",
-            "行高",
-            "调整空间",
-            "当天素材",
-            "MAX口喷卡片",
-            "来源链接",
-            "原始文案 / 逐字稿",
-        ]
-        for marker in required_daily_markers:
-            self.assertIn(marker, collector.DESKTOP_DAILY_HTML)
-
-        for field_name in (
-            "作品链接",
-            "平台",
-            "作品标题",
-            "文案",
-            "封面图链接",
-            "时长",
-            "点赞",
-            "评论",
-            "分享",
-            "发布时间",
-            "抓取状态",
-            "日报日期",
-            "Max反馈",
-        ):
-            self.assertIn(field_name, collector.DESKTOP_DAILY_HTML)
-
-    def test_regression_guardrail_keeps_collector_table_contract(self):
-        collector = load_collector()
-
-        required_app_markers = [
-            "particleCanvas",
-            "tablePrefsVersion=4",
-            "飞书字段配置",
-            "setColumnPreset",
-            "setColumnVisible",
-            "function filteredItems()",
-            "function sortedItems()",
-            "function setRowDensity",
-            "function openDailyPage()",
-            "window.location.href=dailyPageUrl()",
-            "function toggleDaily(id,force)",
-            "function dailyActionHtml(i)",
-            "function openLoginBrowser(platform)",
-            "engine-platform-grid",
-            "function platformStatusHtml(rows)",
-            "/api/browser/login",
-            "function saveVideoFile(id)",
-            "/api/video/save",
-            "录入日报",
-            "删除日报",
-            "已录入",
-            "打开今日日报",
-            "下载视频",
-        ]
-        for marker in required_app_markers:
-            self.assertIn(marker, collector.DESKTOP_APP_HTML)
-
-        for field_name in (
-            "作品链接",
-            "平台",
-            "作品标题",
-            "文案",
-            "封面图链接",
-            "时长",
-            "点赞",
-            "评论",
-            "分享",
-            "发布时间",
-            "抓取状态",
-            "抓取时间",
-            "错误信息",
-            "MAX口喷卡片",
-            "日报日期",
-            "加入日报",
-            "日报排序",
-            "Max反馈",
-        ):
-            self.assertIn(field_name, collector.DESKTOP_APP_HTML)
 
     def test_shipinhao_html_meta_keeps_video_and_status_details(self):
         collector = load_collector()
@@ -3231,7 +3212,7 @@ class WebhookHelperTests(unittest.TestCase):
             def fake_scrape(*args, **kwargs):
                 calls.append(kwargs)
                 return {
-                    "status": "等待登录",
+                    "status": "浏览器未就绪",
                     "title": "",
                     "cover_url": "",
                     "duration": "",
@@ -3574,15 +3555,23 @@ class WebhookHelperTests(unittest.TestCase):
         self.assertEqual(collector.classify_processing_error(RuntimeError("YouTube 没有可用字幕")), "字幕缺失")
         self.assertEqual(collector.classify_processing_error(RuntimeError("其它错误")), "待人工确认")
 
-    def test_classify_browser_target_closed_as_waiting_login(self):
+    def test_classify_browser_errors_are_not_login_errors(self):
         collector = load_collector()
 
         self.assertEqual(
-            collector.classify_processing_error(RuntimeError("等待登录：真实浏览器页面已关闭")),
-            "等待登录",
+            collector.classify_processing_error(RuntimeError("浏览器连接异常：真实浏览器页面已关闭")),
+            "浏览器连接异常",
         )
         self.assertEqual(
             collector.classify_processing_error(RuntimeError("真实浏览器已尝试启动，但 http://127.0.0.1:9223 没有就绪。")),
+            "浏览器未就绪",
+        )
+        self.assertEqual(
+            collector.classify_processing_error(RuntimeError("connect_over_cdp failed")),
+            "浏览器未就绪",
+        )
+        self.assertEqual(
+            collector.classify_processing_error(RuntimeError("等待登录：请完成登录")),
             "等待登录",
         )
 

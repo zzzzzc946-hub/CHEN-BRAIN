@@ -76,8 +76,11 @@ DEFAULT_FIELDS = {
 
 RETRY_TRANSCRIPT_STATUSES = {"待转写", "转写中", "网络异常"}
 RETRY_LOGIN_STATUSES = {"等待登录"}
+BROWSER_RETRY_STATUSES = {"浏览器未就绪", "浏览器连接异常"}
 LOGIN_STATUSES = {"需登录", "需Cookie"}
 WAITING_LOGIN_STATUS = "等待登录"
+BROWSER_NOT_READY_STATUS = "浏览器未就绪"
+BROWSER_CONNECTION_STATUS = "浏览器连接异常"
 DESKTOP_QUEUE_STATUSES = {"待采集"}
 DESKTOP_QUEUE_WORKER_STARTED: set[str] = set()
 DESKTOP_QUEUE_WORKER_LOCK = threading.Lock()
@@ -90,7 +93,6 @@ LOGIN_URLS = {
     "YouTube": "https://www.youtube.com/",
     "Instagram": "https://www.instagram.com/",
 }
-DESKTOP_ENGINE_PLATFORMS = list(LOGIN_URLS.keys())
 
 FIELD_SPECS = [
     ("作品链接", 1, None),
@@ -142,11 +144,6 @@ TRANSCRIPT_KEYS = [
 ]
 
 YOUTUBE_NETWORK_STATUSES = {"VPN/网络异常", "网络异常"}
-DESKTOP_PUBLIC_ALLOWED_GET_PATHS = {"/daily", "/api/daily", "/api/media"}
-DESKTOP_LOCALTUNNEL_SUBDOMAIN = "chen-max-daily"
-DESKTOP_PUBLIC_TUNNEL_PROCESSES: Dict[str, subprocess.Popen] = {}
-DESKTOP_PUBLIC_TUNNEL_MONITORS: set[str] = set()
-DESKTOP_PUBLIC_TUNNEL_MONITOR_LOCK = threading.Lock()
 
 DESKTOP_ITEM_FIELDS = [
     "platform",
@@ -155,7 +152,6 @@ DESKTOP_ITEM_FIELDS = [
     "title",
     "caption",
     "cover_url",
-    "video_path",
     "duration",
     "likes",
     "comments",
@@ -163,13 +159,17 @@ DESKTOP_ITEM_FIELDS = [
     "published_at",
     "status",
     "error",
-    "max_daily_card",
-    "daily_date",
-    "daily_selected",
-    "daily_sort",
-    "max_feedback",
     "raw_metadata_json",
 ]
+
+DESKTOP_DAILY_COLUMNS = {
+    "video_path": "TEXT NOT NULL DEFAULT ''",
+    "max_daily_card": "TEXT NOT NULL DEFAULT ''",
+    "daily_date": "TEXT NOT NULL DEFAULT ''",
+    "daily_selected": "INTEGER NOT NULL DEFAULT 0",
+    "daily_sort": "INTEGER NOT NULL DEFAULT 0",
+    "max_feedback": "TEXT NOT NULL DEFAULT ''",
+}
 
 TEXT_HEADERS = {
     "User-Agent": (
@@ -203,11 +203,8 @@ def desktop_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
 
-def desktop_ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    for name, definition in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+def desktop_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
 
 def desktop_db_init(db_path: Path = DESKTOP_DB_PATH) -> None:
@@ -249,19 +246,24 @@ def desktop_db_init(db_path: Path = DESKTOP_DB_PATH) -> None:
             )
             """
         )
-        desktop_ensure_columns(conn, "collected_items", {
-            "video_path": "TEXT NOT NULL DEFAULT ''",
-            "max_daily_card": "TEXT NOT NULL DEFAULT ''",
-            "daily_date": "TEXT NOT NULL DEFAULT ''",
-            "daily_selected": "INTEGER NOT NULL DEFAULT 0",
-            "daily_sort": "INTEGER NOT NULL DEFAULT 0",
-            "max_feedback": "TEXT NOT NULL DEFAULT ''",
-        })
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_collected_items_table_updated ON collected_items(table_id, updated_at DESC)"
         )
+        existing_item_columns = desktop_column_names(conn, "collected_items")
+        for name, spec in DESKTOP_DAILY_COLUMNS.items():
+            if name not in existing_item_columns:
+                conn.execute(f"ALTER TABLE collected_items ADD COLUMN {name} {spec}")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_collected_items_daily ON collected_items(daily_date, daily_selected, daily_sort)"
+            """
+            CREATE TABLE IF NOT EXISTS daily_reports (
+                id TEXT PRIMARY KEY,
+                table_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
         )
         conn.execute(
             """
@@ -488,86 +490,6 @@ def desktop_list_items(db_path: Path = DESKTOP_DB_PATH, table_id: str = "") -> L
     return [desktop_row_to_dict(row) for row in rows]
 
 
-def desktop_daily_date(date_text: str = "") -> str:
-    value = str(date_text or "").strip()
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
-        return value
-    return dt.datetime.now().strftime("%Y-%m-%d")
-
-
-def desktop_daily_dates(db_path: Path = DESKTOP_DB_PATH) -> List[Dict[str, Any]]:
-    desktop_db_init(db_path)
-    with desktop_connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT daily_date AS date, COUNT(*) AS count
-            FROM collected_items
-            WHERE daily_selected = 1 AND daily_date <> ''
-            GROUP BY daily_date
-            ORDER BY daily_date DESC
-            """
-        ).fetchall()
-    return [desktop_row_to_dict(row) for row in rows]
-
-
-def desktop_latest_daily_date(db_path: Path = DESKTOP_DB_PATH) -> str:
-    dates = desktop_daily_dates(db_path)
-    if dates:
-        return str(dates[0].get("date") or "")
-    return desktop_daily_date("")
-
-
-def desktop_daily_items(db_path: Path = DESKTOP_DB_PATH, date_text: str = "") -> List[Dict[str, Any]]:
-    desktop_db_init(db_path)
-    day = desktop_daily_date(date_text)
-    with desktop_connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM collected_items
-            WHERE daily_selected = 1 AND daily_date = ?
-            ORDER BY daily_sort ASC, datetime(updated_at) DESC
-            """,
-            (day,),
-        ).fetchall()
-        if not rows:
-            rows = conn.execute(
-                """
-                SELECT * FROM collected_items
-                WHERE daily_selected = 1
-                ORDER BY daily_date DESC, daily_sort ASC, datetime(updated_at) DESC
-                LIMIT 12
-                """
-            ).fetchall()
-    return [desktop_row_to_dict(row) for row in rows]
-
-
-def desktop_daily_payload(db_path: Path = DESKTOP_DB_PATH, date_text: str = "") -> Dict[str, Any]:
-    day = desktop_daily_date(date_text) if str(date_text or "").strip() else desktop_latest_daily_date(db_path)
-    items = desktop_daily_items(db_path, day)
-    return {"date": day, "count": len(items), "items": items, "dates": desktop_daily_dates(db_path)}
-
-
-def desktop_media_path(db_path: Path, item_id: str) -> Path:
-    item = desktop_get_item(db_path, item_id)
-    path = Path(str(item.get("video_path") or "")).expanduser()
-    if not str(path):
-        raise ValueError("这条素材还没有保存视频。")
-    if not path.exists() or not path.is_file():
-        raise ValueError("视频文件不存在，请重新下载视频或检查视频路径。")
-    return path
-
-
-def desktop_media_response(handler: http.server.BaseHTTPRequestHandler, path: Path) -> None:
-    content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    data = path.read_bytes()
-    handler.send_response(200)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Content-Length", str(len(data)))
-    handler.send_header("Cache-Control", "private, max-age=3600")
-    handler.end_headers()
-    handler.wfile.write(data)
-
-
 def desktop_get_item(db_path: Path, item_id: str) -> Dict[str, Any]:
     desktop_db_init(db_path)
     if not item_id:
@@ -577,6 +499,150 @@ def desktop_get_item(db_path: Path, item_id: str) -> Dict[str, Any]:
     if row is None:
         raise ValueError("没有找到这条采集结果")
     return desktop_row_to_dict(row)
+
+
+def desktop_daily_card_text(item: Dict[str, Any]) -> str:
+    title = item.get("title") or "未命名素材"
+    caption = desktop_caption_excerpt(item.get("caption") or "", 900)
+    metrics = desktop_metric_text(item)
+    return "\n".join(
+        [
+            "【MAX可口喷卡片】",
+            "",
+            "来源信息：",
+            f"{item.get('platform') or ''} / {item.get('source_url') or ''} / {metrics} / 标题：{title}",
+            "",
+            "话题 / 母题：",
+            "",
+            "材料摘要：",
+            caption or "暂无文案/逐字稿。",
+            "",
+            "可口喷判断：",
+            "",
+            "目标用户为什么会关心：",
+            "",
+        ]
+    ).strip()
+
+
+def desktop_daily_add_items(
+    db_path: Path,
+    table_id: str,
+    item_ids: List[str],
+    daily_date: str = "",
+) -> Dict[str, Any]:
+    desktop_db_init(db_path)
+    selected = [str(item_id) for item_id in item_ids if str(item_id)]
+    if not selected:
+        return {"ok": True, "count": 0}
+    date_text = str(daily_date or dt.date.today().isoformat())
+    updated = 0
+    ts = now_text()
+    with desktop_connect(db_path) as conn:
+        for item_id in selected:
+            row = conn.execute("SELECT * FROM collected_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                continue
+            item = desktop_row_to_dict(row)
+            card = item.get("max_daily_card") or desktop_daily_card_text(item)
+            sort_row = conn.execute(
+                "SELECT COALESCE(MAX(daily_sort), 0) FROM collected_items WHERE table_id = ? AND daily_date = ?",
+                (table_id or item.get("table_id") or "", date_text),
+            ).fetchone()
+            next_sort = int(sort_row[0] or 0) + 1
+            conn.execute(
+                """
+                UPDATE collected_items
+                SET daily_selected = 1, daily_date = ?, daily_sort = ?, max_daily_card = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (date_text, next_sort, card, ts, item_id),
+            )
+            updated += 1
+    return {"ok": True, "count": updated, "date": date_text}
+
+
+def desktop_daily_remove_items(db_path: Path, item_ids: List[str]) -> Dict[str, Any]:
+    desktop_db_init(db_path)
+    selected = [str(item_id) for item_id in item_ids if str(item_id)]
+    if not selected:
+        return {"ok": True, "count": 0}
+    ts = now_text()
+    with desktop_connect(db_path) as conn:
+        for item_id in selected:
+            conn.execute(
+                """
+                UPDATE collected_items
+                SET daily_selected = 0, daily_date = '', daily_sort = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (ts, item_id),
+            )
+    return {"ok": True, "count": len(selected)}
+
+
+def desktop_daily_update_card(db_path: Path, item_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    desktop_db_init(db_path)
+    editable = {"max_daily_card", "max_feedback", "daily_sort", "daily_date"}
+    clean: Dict[str, Any] = {}
+    for key, value in (updates or {}).items():
+        if key not in editable:
+            continue
+        clean[key] = int(value or 0) if key == "daily_sort" else str(value or "")
+    if not item_id:
+        raise ValueError("缺少 item_id")
+    if not clean:
+        raise ValueError("没有可更新的日报字段")
+    ts = now_text()
+    assignments = ", ".join([f"{key} = ?" for key in clean])
+    values = list(clean.values())
+    values.extend([ts, item_id])
+    with desktop_connect(db_path) as conn:
+        conn.execute(f"UPDATE collected_items SET {assignments}, updated_at = ? WHERE id = ?", values)
+        row = conn.execute("SELECT * FROM collected_items WHERE id = ?", (item_id,)).fetchone()
+    if row is None:
+        raise ValueError("没有找到这条日报卡片")
+    return desktop_row_to_dict(row)
+
+
+def desktop_daily_cards(db_path: Path, table_id: str = "", daily_date: str = "") -> List[Dict[str, Any]]:
+    desktop_db_init(db_path)
+    params: List[Any] = []
+    where = ["daily_selected = 1"]
+    if table_id:
+        where.append("table_id = ?")
+        params.append(table_id)
+    if daily_date:
+        where.append("daily_date = ?")
+        params.append(daily_date)
+    with desktop_connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM collected_items
+            WHERE {' AND '.join(where)}
+            ORDER BY daily_date DESC, daily_sort ASC, datetime(updated_at) DESC
+            """,
+            params,
+        ).fetchall()
+    return [desktop_row_to_dict(row) for row in rows]
+
+
+def desktop_daily_summary(db_path: Path, table_id: str = "", daily_date: str = "") -> Dict[str, Any]:
+    all_cards = desktop_daily_cards(db_path, table_id, "")
+    dates: Dict[str, int] = {}
+    for item in all_cards:
+        date_key = str(item.get("daily_date") or "")
+        if date_key:
+            dates[date_key] = dates.get(date_key, 0) + 1
+    selected_date = daily_date or (all_cards[0].get("daily_date") if all_cards else dt.date.today().isoformat())
+    cards = [item for item in all_cards if str(item.get("daily_date") or "") == selected_date] if selected_date else all_cards
+    return {
+        "ok": True,
+        "date": selected_date,
+        "count": len(cards),
+        "items": cards,
+        "dates": [{"date": date, "count": count} for date, count in sorted(dates.items(), reverse=True)],
+    }
 
 
 def desktop_update_item(db_path: Path, item_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -593,19 +659,15 @@ def desktop_update_item(db_path: Path, item_id: str, updates: Dict[str, Any]) ->
         "status",
         "error",
         "max_daily_card",
-        "daily_date",
-        "daily_selected",
-        "daily_sort",
-        "max_feedback",
     }
     clean: Dict[str, Any] = {}
     for key, value in updates.items():
         if key not in editable:
             continue
-        if key in {"likes", "comments", "shares", "daily_sort"}:
+        if key in {"likes", "comments", "shares"}:
             clean[key] = desktop_int_or_none(value)
-        elif key == "daily_selected":
-            clean[key] = 1 if value in {True, 1, "1", "true", "True", "yes", "on"} else 0
+        elif key == "max_daily_card":
+            clean[key] = str(value or "")
         else:
             clean[key] = str(value or "").strip()
     if not item_id:
@@ -1188,57 +1250,12 @@ def launchctl_label_running(label: str) -> bool:
         return False
 
 
-def desktop_item_platform(item: Dict[str, Any]) -> str:
-    platform = str(item.get("platform") or "").strip()
-    if platform in DESKTOP_ENGINE_PLATFORMS:
-        return platform
-    detected = detect_platform(str(item.get("source_url") or ""))
-    return detected if detected in DESKTOP_ENGINE_PLATFORMS else "未知"
-
-
-def desktop_platform_statuses(items: List[Dict[str, Any]], cdp_ok: bool) -> List[Dict[str, Any]]:
-    waiting_statuses = LOGIN_STATUSES | RETRY_LOGIN_STATUSES
-    waiting_by_platform = {platform: 0 for platform in DESKTOP_ENGINE_PLATFORMS}
-    active_by_platform = {platform: 0 for platform in DESKTOP_ENGINE_PLATFORMS}
-    for item in items:
-        platform = desktop_item_platform(item)
-        if platform not in waiting_by_platform:
-            continue
-        status = str(item.get("status") or "")
-        if status in waiting_statuses:
-            waiting_by_platform[platform] += 1
-        if status in DESKTOP_QUEUE_STATUSES or status == "采集中":
-            active_by_platform[platform] += 1
-    rows: List[Dict[str, Any]] = []
-    for platform in DESKTOP_ENGINE_PLATFORMS:
-        waiting = waiting_by_platform[platform]
-        active = active_by_platform[platform]
-        if waiting:
-            status = "需要登录"
-            tone = "warn"
-        elif cdp_ok:
-            status = "浏览器已连接"
-            tone = "ok"
-        else:
-            status = "浏览器未连接"
-            tone = "error"
-        rows.append({
-            "platform": platform,
-            "status": status,
-            "tone": tone,
-            "waiting_login_count": waiting,
-            "active_count": active,
-            "browser": "运行中" if cdp_ok else "未连接",
-            "login_url": login_url_for_platform(platform),
-        })
-    return rows
-
-
 def desktop_engine_status(db_path: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
     pending = desktop_queue_pending_items(db_path, limit=1000)
     items = desktop_list_items(db_path)
     processing_count = sum(1 for item in items if item.get("status") == "采集中")
     waiting_login_count = sum(1 for item in items if item.get("status") in (LOGIN_STATUSES | RETRY_LOGIN_STATUSES))
+    browser_retry_count = sum(1 for item in items if item.get("status") in BROWSER_RETRY_STATUSES)
     fallback_cfg = browser_fallback_config(cfg)
     cdp_ok = cdp_browser_available(fallback_cfg) if fallback_cfg.get("enabled", True) else False
     power = pmset_power_summary()
@@ -1248,6 +1265,8 @@ def desktop_engine_status(db_path: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
         status = "有待采集任务"
     elif waiting_login_count:
         status = "需要登录处理"
+    elif browser_retry_count:
+        status = "浏览器待恢复"
     else:
         status = "在线可采集"
     return {
@@ -1257,8 +1276,8 @@ def desktop_engine_status(db_path: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "pending_count": len(pending),
         "processing_count": processing_count,
         "waiting_login_count": waiting_login_count,
+        "browser_retry_count": browser_retry_count,
         "cdp_browser": "运行中" if cdp_ok else "未连接",
-        "platform_statuses": desktop_platform_statuses(items, cdp_ok),
         "power_source": power.get("source") or "未知",
         "keep_awake_ac": "运行中" if launchctl_label_running(queue_label) else "未运行",
         "desktop_service": "运行中" if launchctl_label_running(app_label) else "当前进程",
@@ -1634,7 +1653,7 @@ def desktop_profile_complete_video(
                 has_core_data = bool(result.get("title") and result.get("cover_url") and result.get("duration"))
                 if status in {"基础信息成功", "成功", "图文作品"} and has_core_data:
                     break
-                if attempt < 3 and status in {"等待登录", "待人工确认", "网络异常"}:
+                if attempt < 3 and status in ({"等待登录", "待人工确认", "网络异常"} | BROWSER_RETRY_STATUSES):
                     time.sleep(2 * attempt)
                     continue
                 break
@@ -1821,38 +1840,31 @@ DESKTOP_APP_HTML = r"""<!doctype html>
   <title>CHEN 内容采集助手</title>
   <style>
     :root{color-scheme:dark;--bg:#081120;--panel:#101d31;--panel2:#17263c;--line:rgba(255,255,255,.11);--text:#eef5ff;--muted:#9aa9bf;--orange:#ff982f;--orange2:#f06118;--green:#4fe083;--blue:#45a9ff;--pink:#ff4e9a}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",Inter,sans-serif;background:radial-gradient(circle at 76% 15%,rgba(255,152,47,.22),transparent 22rem),linear-gradient(145deg,#081120,#101a2d 58%,#091323);color:var(--text);padding:24px}.window{max-width:1380px;min-height:850px;margin:auto;border:1px solid rgba(255,255,255,.08);border-radius:18px;overflow:hidden;background:rgba(8,15,28,.9);box-shadow:0 26px 90px rgba(0,0,0,.45)}.home-page.hidden{display:none!important}.hero{display:grid;grid-template-columns:1fr 380px;gap:30px;padding:34px 48px 26px;align-items:center}.hero h1{margin:0 0 14px;font-size:54px;line-height:1.06;letter-spacing:0}.hero h1 span{color:var(--orange)}.hero p{margin:0 0 24px;max-width:720px;color:var(--muted);font-size:18px;line-height:1.75}.btn{border:0;border-radius:10px;min-height:42px;padding:0 19px;background:#26344b;color:#e9f2ff;font-weight:900;cursor:pointer}.btn.primary{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033}.btn.danger{background:#493044;color:#ffdce7}.actions{display:flex;gap:14px;align-items:center}.orange-stage{height:300px;display:grid;place-items:center;position:relative}.orange-buddy{width:210px;height:210px;border-radius:50%;background:radial-gradient(circle at 35% 28%,#ffe7bd 0 9%,transparent 10%),radial-gradient(circle at 65% 69%,rgba(255,255,255,.11) 0 2.2%,transparent 3%),linear-gradient(145deg,#ffbd49,var(--orange) 54%,#ed5b1a);box-shadow:inset -16px -20px 38px rgba(138,55,10,.22),inset 9px 10px 24px rgba(255,255,255,.17),0 0 62px rgba(255,152,47,.42);position:relative;animation:float 3.8s ease-in-out infinite;transform-origin:50% 78%}.orange-buddy:before{content:"";position:absolute;width:74px;height:40px;top:-23px;left:100px;border-radius:100% 0 100% 0;background:linear-gradient(135deg,#8af0a3,#31b660);transform:rotate(-18deg)}.face{position:absolute;inset:72px 43px auto;height:78px;transition:.18s}.eye{position:absolute;top:6px;width:40px;height:40px;border-radius:50%;background:#fffdf4;animation:blink 5.2s infinite}.eye.left{left:0}.eye.right{right:0}.eye:before{content:"";position:absolute;inset:7px;border-radius:50%;background:#111725}.eye:after{content:"";position:absolute;width:11px;height:11px;border-radius:50%;background:#fff;top:10px;left:10px}.cheek{position:absolute;top:48px;width:30px;height:13px;border-radius:50%;background:rgba(255,122,154,.42)}.cheek.left{left:2px}.cheek.right{right:2px}.mouth{position:absolute;left:50%;top:43px;width:34px;height:23px;transform:translateX(-50%);border-bottom:5px solid #101725;border-radius:0 0 42px 42px}.juice{position:absolute;left:50%;top:210px;width:42px;height:0;transform:translateX(-50%);border-radius:999px;background:linear-gradient(#ffd56e,#ff8c2f);opacity:0}.glass{position:absolute;left:50%;top:252px;width:88px;height:58px;transform:translateX(-50%);border:2px solid rgba(255,255,255,.25);border-top:0;border-radius:0 0 18px 18px;overflow:hidden;opacity:.62}.glass:before{content:"";position:absolute;left:0;right:0;bottom:0;height:18px;background:linear-gradient(#ffd56e,#ff8c2f);opacity:.72}.orange-stage:hover .orange-buddy{animation:squeeze 1.45s ease-in-out infinite;filter:brightness(1.08)}.orange-stage:hover .face{transform:scaleY(.84) translateY(8px)}.orange-stage:hover .juice{animation:pour 1.45s ease-in-out infinite}@keyframes float{50%{transform:translateY(-10px)}}@keyframes squeeze{0%,100%{transform:scale(1)}38%{transform:translateY(18px) scale(1.16,.76)}58%{transform:translateY(-5px) scale(.92,1.12)}}@keyframes pour{0%,24%,100%{height:0;opacity:0}34%{height:58px;opacity:1}72%{height:44px;opacity:.85}}@keyframes blink{0%,92%,100%{transform:scaleY(1)}95%{transform:scaleY(.12)}97%{transform:scaleY(1)}}
-    .platforms{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;padding:0 48px 26px}.platform{background:rgba(17,29,49,.9);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:16px;min-height:220px;transition:.18s;cursor:pointer;display:flex;flex-direction:column}.platform:hover{transform:translateY(-2px);border-color:rgba(255,255,255,.18);background:rgba(20,34,55,.95)}.platform.selected{transform:translateY(-2px);border-color:rgba(255,152,47,.65);box-shadow:0 0 0 1px rgba(255,152,47,.22),0 0 38px rgba(255,152,47,.26);background:linear-gradient(180deg,rgba(66,44,19,.88),rgba(17,29,49,.9))}.platform-head{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:900;padding-bottom:12px;border-bottom:1px dashed rgba(255,255,255,.18)}.appicon{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-weight:950;position:relative;overflow:hidden}.dy{background:linear-gradient(145deg,#27101f,#07070d)}.dy:before{content:"♪";font-size:31px;color:#fff;text-shadow:-3px 0 #20e2ee,3px 2px #ff2c7d}.xhs{background:#ff2442}.xhs:before{content:"小红书";font-size:9px;color:#fff}.bz{background:#e8669a}.bz:before{content:"bilibili";font-size:9px;color:#fff}.shipin{background:#ff9d32}.shipin:before{content:"∞";font-size:30px;color:#fff}.yt{background:#ff0033}.yt:before{content:"▶";font-size:22px;color:#fff}.ig{background:linear-gradient(135deg,#833ab4,#fd1d1d 50%,#fcb045)}.ig:before{content:"◎";font-size:27px;color:#fff}.platform ul{margin:14px 0 14px;padding:0;list-style:none;color:#d8e6f8;font-weight:800;line-height:1.9}.platform li:before{content:"✓";color:var(--green);margin-right:8px}.platform li.pending:before{content:"•";color:#ffd36b}.platform-actions{display:flex;gap:12px;margin-top:auto}.platform-actions .btn{flex:1}.page.hidden,.home-page.hidden{display:none!important}
-    .home-tables{display:grid;grid-template-columns:390px minmax(0,1fr);gap:16px;padding:0 48px 28px}.app-page{padding:30px 42px;min-height:850px}.workspace-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.workspace-title{display:flex;align-items:center;gap:12px;font-size:22px;font-weight:950}.workspace{display:grid;grid-template-columns:420px minmax(0,1fr);gap:16px}.panel{background:rgba(17,29,49,.92);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:16px;min-width:0}.panel h2{margin:0 0 14px;font-size:18px}.table-list{display:grid;gap:8px}.table-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#1b2a41;padding:10px 10px 10px 12px;font-weight:900;cursor:pointer}.table-row:hover{border-color:rgba(255,255,255,.2);background:#23344f}.table-row.selected{border-color:var(--orange);background:linear-gradient(90deg,rgba(255,152,47,.22),#22334d)}.table-main{min-width:0}.table-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.table-meta{display:block;margin-top:4px;color:#9eb0c8;font-size:12px;font-weight:800}.table-actions,.confirm-actions,.new-table,.tabs,.views,.view-tools,.candidate-tools,.table-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.table-edit,.mini-btn{min-height:30px;padding:0 10px;border-radius:8px;background:rgba(255,255,255,.08);font-size:12px}.new-table{margin:12px 0}.new-table input,.rename-form input,.control textarea{width:100%;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:#0b1424;color:#edf6ff;padding:12px;font:inherit}.control textarea{min-height:230px;resize:vertical;-webkit-user-select:text;user-select:text}.tab,.view{background:#26344b}.tab.active,.view.active{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033}.mode-note{border:1px solid rgba(69,169,255,.22);background:rgba(69,169,255,.08);border-radius:10px;padding:10px;color:#b9d8fb;line-height:1.55;margin-bottom:12px}.status{min-height:22px;color:#aac0da;margin-top:12px;line-height:1.5}.status.error{color:#ffb7c8}.status.ok{color:#aef3c7}.status.compact{font-size:12px;min-height:18px}.engine-card{margin:0 0 18px;border:1px solid rgba(255,255,255,.1);border-radius:12px;background:rgba(11,20,36,.78);padding:12px;max-width:560px}.engine-main{display:flex;align-items:center;gap:8px}.engine-dot{width:10px;height:10px;border-radius:50%;background:#9aa9bf;box-shadow:0 0 0 4px rgba(255,255,255,.05)}.engine-card.ok .engine-dot,.engine-mini.ok:before{background:var(--green)}.engine-card.warn .engine-dot,.engine-mini.warn:before{background:#ffd36b}.engine-card.error .engine-dot,.engine-mini.error:before{background:#ff6b8f}.engine-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px;color:#aabbd2;font-size:12px;font-weight:850}.engine-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.engine-actions .btn{min-height:32px;padding:0 10px;border-radius:8px;font-size:12px}.engine-mini{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#0b1424;color:#b9c8dd;padding:9px 10px;margin-bottom:12px;font-size:12px;font-weight:900}.engine-mini:before{content:"";width:8px;height:8px;border-radius:50%;background:#9aa9bf}.help{margin-top:18px;color:#9eb0c8;line-height:1.7}.youtube-tools{display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(11,20,36,.72)}.youtube-tools.open{display:flex}.guide{display:grid;gap:12px;color:#dce8f7}.guide-section{border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#0b1424;padding:12px}.guide-section h3{margin:0 0 8px;font-size:15px}.guide-badge{display:inline-flex;border-radius:999px;background:rgba(255,152,47,.16);color:#ffd9a8;padding:2px 8px;font-size:12px;font-weight:950}.table-scroll{overflow:auto;border:1px solid rgba(255,255,255,.09);border-radius:10px;max-height:560px;min-height:220px;resize:vertical;background:#0b1424}.result-table{border-collapse:collapse;font-size:13px;min-width:1720px;width:max-content;table-layout:fixed;-webkit-user-select:text;user-select:text}.result-table th,.result-table td{border:1px solid rgba(255,255,255,.08);padding:8px 9px;text-align:left;vertical-align:top}.result-table th{color:#aac0da;background:#203048;position:sticky;top:0;z-index:1;height:38px;white-space:nowrap;overflow:hidden}.result-table tbody tr{height:96px}.result-table tbody tr:hover{background:rgba(255,255,255,.035)}.result-table tbody tr.row-selected{background:rgba(255,152,47,.1);box-shadow:inset 3px 0 0 var(--orange)}.th-inner{display:flex;align-items:center;justify-content:space-between;gap:8px}.col-resizer{display:block;width:8px;align-self:stretch;cursor:col-resize;border-radius:99px;opacity:.55}.candidate-check{width:18px;height:18px;accent-color:var(--orange);cursor:pointer}.editable-cell{min-width:0;max-height:74px;outline:0;border-radius:6px;white-space:pre-wrap;overflow:auto;line-height:1.42;cursor:text}.editable-cell.cell-short{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.editable-cell.cell-long{max-height:74px}.editable-cell:hover{background:rgba(255,255,255,.055)}.editable-cell:focus{background:#0b1424;box-shadow:0 0 0 2px rgba(255,152,47,.55);padding:4px;max-height:240px;resize:vertical;overflow:auto}.copy-btn{min-height:26px;padding:0 8px;border-radius:7px;background:rgba(255,255,255,.08);font-size:12px;margin-top:6px}.cover-btn{display:block;border:0;padding:0;background:transparent;cursor:zoom-in}.cover{width:48px;height:64px;object-fit:cover;border-radius:6px;background:#0b1424}.source-link{max-height:38px;overflow:hidden;color:#9ed1ff;line-height:1.35;word-break:break-all}.status-pill{display:inline-flex;border-radius:999px;padding:3px 8px;background:rgba(255,255,255,.08);font-size:12px;font-weight:900}.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}.card{border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:12px;background:#142238}.card h3{margin:8px 0;font-size:15px}.muted{color:var(--muted)}.detail{white-space:pre-wrap;line-height:1.65;background:#0b1424;border-radius:10px;padding:14px;color:#dce8f7;max-height:420px;overflow:auto;-webkit-user-select:text;user-select:text}.modal{position:fixed;inset:0;display:none;place-items:center;background:rgba(2,7,14,.76);z-index:99;padding:18px}.modal.open{display:grid}.modal-card{width:min(760px,92vw);max-height:86vh;border:1px solid rgba(255,255,255,.14);border-radius:12px;background:#101d31;box-shadow:0 20px 58px rgba(0,0,0,.5);overflow:hidden}.modal-card.compact{width:min(520px,92vw)}.modal-card.help-modal{width:min(620px,92vw)}.modal-body{padding:14px;display:grid;gap:12px}.modal-head{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1)}.modal-actions{display:flex;gap:6px;align-items:center}.export-row{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center}.export-row select{border:1px solid rgba(255,255,255,.12);border-radius:9px;background:#0b1424;color:#edf6ff;padding:10px;font:inherit}.export-note{border-radius:10px;background:#0b1424;color:#9ed1ff;padding:10px;min-height:42px;line-height:1.45;word-break:break-all}.modal-img-wrap{display:grid;place-items:center;max-height:62vh;padding:14px;background:#081120}.modal-img-wrap img{max-width:100%;max-height:58vh;border-radius:9px;object-fit:contain}.modal-url{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:9px 12px;color:#9ed1ff;background:#142238;font-size:12px;-webkit-user-select:text;user-select:text}.toolbar-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}.toolbar-field{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:#142238;padding:8px 10px;font-size:12px;font-weight:900}.toolbar-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;align-items:center}.toolbar-form input,.toolbar-form select{width:100%;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#101d31;color:#edf6ff;padding:9px;font:inherit;font-size:13px}.density-actions{display:flex;gap:8px;flex-wrap:wrap}.sort-mark{color:#ffd36b;font-size:11px;margin-left:4px}.particle-canvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.62}.window,.wrap{position:relative;z-index:1}.btn,.table-row,.card,.toolbar-field,.item{transition:transform .28s cubic-bezier(.2,.8,.2,1),box-shadow .28s cubic-bezier(.2,.8,.2,1),background .28s,border-color .28s,filter .28s}.btn{box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 8px 24px rgba(0,0,0,.18)}.btn:hover{transform:translateY(-2px);filter:brightness(1.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 14px 34px rgba(0,0,0,.28)}.btn:active{transform:translateY(1px) scale(.985);transition-duration:.1s}.btn.primary,.btn.active,.table-tool.primary{box-shadow:0 0 0 1px rgba(255,190,95,.24),0 12px 34px rgba(255,152,47,.18)}.toolbar-panel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:9px;color:#dce8f7}.toolbar-panel-head strong{color:#fff}.toolbar-panel-head span{color:#9eb0c8;font-size:12px;font-weight:800}.feishu-fields .toolbar-field{min-height:42px;border-radius:10px;background:linear-gradient(180deg,rgba(31,49,74,.92),rgba(17,29,49,.92))}.toolbar-field input,.candidate-check{accent-color:var(--orange)}.toolbar-field:hover{transform:translateY(-1px);border-color:rgba(255,152,47,.35);box-shadow:0 10px 24px rgba(0,0,0,.18)}.table-toolbar-panel.open{animation:panelIn .24s cubic-bezier(.2,.8,.2,1)}@keyframes panelIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}.result-table.density-compact tbody tr{height:58px}.result-table.density-compact th,.result-table.density-compact td{padding:5px 7px}.result-table.density-compact .editable-cell{max-height:44px}.result-table.density-normal tbody tr{height:96px}.result-table.density-relaxed tbody tr{height:138px}.result-table.density-relaxed th,.result-table.density-relaxed td{padding:12px}.result-table.density-relaxed .editable-cell{max-height:116px}.status-pill.daily-on{background:rgba(79,224,131,.15);color:#bff8d0}@media(max-width:1050px){.hero,.workspace,.home-tables{grid-template-columns:1fr}.platforms{grid-template-columns:repeat(2,1fr)}}@media(max-width:680px){body{padding:0;background:#081120}.window{border-radius:0;border:0;min-height:100vh}.hero{padding:22px 14px 16px;grid-template-columns:1fr}.hero h1{font-size:34px}.orange-stage{display:none}.platforms,.home-tables,.app-page{padding-left:14px;padding-right:14px}.platforms{grid-template-columns:1fr}.actions,.tabs{display:grid;grid-template-columns:1fr 1fr}.engine-grid{grid-template-columns:1fr}.table-primary-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}}
-    .engine-platform-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}.engine-platform{border:1px solid rgba(255,255,255,.08);border-radius:10px;background:linear-gradient(180deg,rgba(31,49,74,.82),rgba(11,20,36,.86));padding:9px;transition:transform .28s cubic-bezier(.2,.8,.2,1),border-color .28s,box-shadow .28s}.engine-platform:hover{transform:translateY(-2px);border-color:rgba(255,152,47,.3);box-shadow:0 12px 28px rgba(0,0,0,.2)}.engine-platform-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:950}.engine-platform-status{margin-top:5px;color:#9eb0c8;font-size:11px;font-weight:850;line-height:1.45}.engine-platform .btn{width:100%;min-height:28px;margin-top:7px;padding:0 8px;border-radius:7px;font-size:11px}.engine-platform.ok{border-color:rgba(79,224,131,.18)}.engine-platform.warn{border-color:rgba(255,211,107,.35);background:linear-gradient(180deg,rgba(64,53,28,.86),rgba(26,31,38,.9))}.engine-platform.error{border-color:rgba(255,107,143,.24)}.platform-pill{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 7px;background:rgba(255,255,255,.07);color:#dce8f7}.platform-pill:before{content:"";width:7px;height:7px;border-radius:50%;background:#9aa9bf}.engine-platform.ok .platform-pill:before{background:var(--green)}.engine-platform.warn .platform-pill:before{background:#ffd36b}.engine-platform.error .platform-pill:before{background:#ff6b8f}@media(max-width:680px){.engine-platform-grid{grid-template-columns:1fr}}
-    .engine-card.compact{position:relative;max-width:460px;padding:10px 12px;margin-bottom:14px}.engine-compact-summary{display:flex;align-items:center;justify-content:space-between;gap:10px}.engine-compact-title{display:flex;align-items:center;gap:8px;min-width:0}.engine-compact-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.engine-card.compact .engine-grid{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:8px;font-size:11px}.engine-card.compact .engine-actions{margin-top:8px}.engine-card.compact .engine-actions .btn{min-height:28px;font-size:11px}.engine-status-popover{display:none;position:absolute;left:0;top:calc(100% + 8px);z-index:30;width:min(560px,86vw);padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:12px;background:rgba(11,20,36,.98);box-shadow:0 24px 70px rgba(0,0,0,.48);backdrop-filter:blur(16px)}.engine-status-popover.open{display:block;animation:panelIn .22s cubic-bezier(.2,.8,.2,1)}.engine-popover-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.engine-popover-head strong{font-size:13px}.engine-popover-head .btn{min-height:26px;padding:0 8px;border-radius:7px;font-size:11px}@media(max-width:680px){.engine-card.compact{max-width:none}.engine-status-popover{position:fixed;left:14px;right:14px;top:auto;bottom:18px;width:auto}}
-    .editable-cell{overflow-wrap:anywhere;word-break:break-word}
-    .daily-hero-btn{min-height:54px;padding:0 24px;border-radius:14px;background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033;box-shadow:0 0 0 1px rgba(255,190,95,.24),0 16px 38px rgba(255,152,47,.22)}
-    .daily-action{display:grid;gap:6px;align-items:start}.daily-action .btn{width:max-content}.daily-action .status-pill{width:max-content}.daily-action-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.copy-btn.primary{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033}.copy-btn.danger{background:rgba(255,78,122,.18);color:#ffd7e1;box-shadow:inset 0 0 0 1px rgba(255,78,122,.18)}
-    .result-table.table-fit-panel{min-width:100%;width:100%}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",Inter,sans-serif;background:radial-gradient(circle at 76% 15%,rgba(255,152,47,.22),transparent 22rem),linear-gradient(145deg,#081120,#101a2d 58%,#091323);color:var(--text);padding:24px}.window{max-width:1380px;min-height:850px;margin:auto;border:1px solid rgba(255,255,255,.08);border-radius:18px;overflow:hidden;background:rgba(8,15,28,.9);box-shadow:0 26px 90px rgba(0,0,0,.45)}.home-page.hidden{display:none!important}.hero{display:grid;grid-template-columns:1fr 380px;gap:30px;padding:34px 48px 26px;align-items:center}.hero h1{margin:0 0 14px;font-size:54px;line-height:1.06;letter-spacing:0}.hero h1 span{color:var(--orange)}.hero p{margin:0 0 24px;max-width:720px;color:var(--muted);font-size:18px;line-height:1.75}.btn{border:0;border-radius:10px;min-height:42px;padding:0 19px;background:#26344b;color:#e9f2ff;font-weight:900;cursor:pointer}.btn.primary{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033}.btn.danger{background:#493044;color:#ffdce7}.actions{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.daily-hero-btn{min-height:50px;padding:0 22px;border-radius:14px;background:linear-gradient(135deg,#ffec9c,#ff982f 58%,#ff6f61)!important;color:#151b28!important;box-shadow:0 16px 34px rgba(255,128,47,.32),inset 0 1px 0 rgba(255,255,255,.45);transform:translateZ(0);transition:transform .22s cubic-bezier(.18,.89,.32,1.28),box-shadow .22s ease,filter .22s ease}.daily-hero-btn:hover{transform:translateY(-2px) scale(1.018);filter:brightness(1.04);box-shadow:0 22px 42px rgba(255,128,47,.42),inset 0 1px 0 rgba(255,255,255,.5)}.daily-hero-btn:active{transform:translateY(1px) scale(.982);box-shadow:0 8px 18px rgba(255,128,47,.28),inset 0 2px 8px rgba(116,51,0,.18)}.orange-stage{height:300px;display:grid;place-items:center;position:relative}.orange-buddy{width:210px;height:210px;border-radius:50%;background:radial-gradient(circle at 35% 28%,#ffe7bd 0 9%,transparent 10%),radial-gradient(circle at 65% 69%,rgba(255,255,255,.11) 0 2.2%,transparent 3%),linear-gradient(145deg,#ffbd49,var(--orange) 54%,#ed5b1a);box-shadow:inset -16px -20px 38px rgba(138,55,10,.22),inset 9px 10px 24px rgba(255,255,255,.17),0 0 62px rgba(255,152,47,.42);position:relative;animation:float 3.8s ease-in-out infinite;transform-origin:50% 78%}.orange-buddy:before{content:"";position:absolute;width:74px;height:40px;top:-23px;left:100px;border-radius:100% 0 100% 0;background:linear-gradient(135deg,#8af0a3,#31b660);transform:rotate(-18deg)}.face{position:absolute;inset:72px 43px auto;height:78px;transition:.18s}.eye{position:absolute;top:6px;width:40px;height:40px;border-radius:50%;background:#fffdf4;animation:blink 5.2s infinite}.eye.left{left:0}.eye.right{right:0}.eye:before{content:"";position:absolute;inset:7px;border-radius:50%;background:#111725}.eye:after{content:"";position:absolute;width:11px;height:11px;border-radius:50%;background:#fff;top:10px;left:10px}.cheek{position:absolute;top:48px;width:30px;height:13px;border-radius:50%;background:rgba(255,122,154,.42)}.cheek.left{left:2px}.cheek.right{right:2px}.mouth{position:absolute;left:50%;top:43px;width:34px;height:23px;transform:translateX(-50%);border-bottom:5px solid #101725;border-radius:0 0 42px 42px}.juice{position:absolute;left:50%;top:210px;width:42px;height:0;transform:translateX(-50%);border-radius:999px;background:linear-gradient(#ffd56e,#ff8c2f);opacity:0}.glass{position:absolute;left:50%;top:252px;width:88px;height:58px;transform:translateX(-50%);border:2px solid rgba(255,255,255,.25);border-top:0;border-radius:0 0 18px 18px;overflow:hidden;opacity:.62}.glass:before{content:"";position:absolute;left:0;right:0;bottom:0;height:18px;background:linear-gradient(#ffd56e,#ff8c2f);opacity:.72}.orange-stage:hover .orange-buddy{animation:squeeze 1.45s ease-in-out infinite;filter:brightness(1.08)}.orange-stage:hover .face{transform:scaleY(.84) translateY(8px)}.orange-stage:hover .juice{animation:pour 1.45s ease-in-out infinite}@keyframes float{50%{transform:translateY(-10px)}}@keyframes squeeze{0%,100%{transform:scale(1)}38%{transform:translateY(18px) scale(1.16,.76)}58%{transform:translateY(-5px) scale(.92,1.12)}}@keyframes pour{0%,24%,100%{height:0;opacity:0}34%{height:58px;opacity:1}72%{height:44px;opacity:.85}}@keyframes blink{0%,92%,100%{transform:scaleY(1)}95%{transform:scaleY(.12)}97%{transform:scaleY(1)}}
+    .platforms{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;padding:0 48px 26px}.platform{background:rgba(17,29,49,.9);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:16px;min-height:220px;transition:.18s;cursor:pointer;display:flex;flex-direction:column}.platform:hover{transform:translateY(-2px);border-color:rgba(255,255,255,.18);background:rgba(20,34,55,.95)}.platform.selected{transform:translateY(-2px);border-color:rgba(255,152,47,.65);box-shadow:0 0 0 1px rgba(255,152,47,.22),0 0 38px rgba(255,152,47,.26);background:linear-gradient(180deg,rgba(66,44,19,.88),rgba(17,29,49,.9))}.platform-head{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:900;padding-bottom:12px;border-bottom:1px dashed rgba(255,255,255,.18)}.appicon{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-weight:950;position:relative;overflow:hidden}.dy{background:linear-gradient(145deg,#27101f,#07070d)}.dy:before{content:"♪";font-size:31px;color:#fff;text-shadow:-3px 0 #20e2ee,3px 2px #ff2c7d}.xhs{background:#ff2442}.xhs:before{content:"小红书";font-size:9px;color:#fff}.bz{background:#e8669a}.bz:before{content:"bilibili";font-size:9px;color:#fff}.shipin{background:#ff9d32}.shipin:before{content:"∞";font-size:30px;color:#fff}.yt{background:#ff0033}.yt:before{content:"▶";font-size:22px;color:#fff}.ig{background:linear-gradient(135deg,#833ab4,#fd1d1d 50%,#fcb045)}.ig:before{content:"◎";font-size:27px;color:#fff}.platform ul{margin:14px 0 14px;padding:0;list-style:none;color:#d8e6f8;font-weight:800;line-height:1.9}.platform li:before{content:"✓";color:var(--green);margin-right:8px}.platform li.pending:before{content:"•";color:#ffd36b}.platform-actions{display:flex;gap:12px;margin-top:auto}.platform-actions .btn{flex:1}.page.hidden{display:none!important}
+    .home-tables{display:grid;grid-template-columns:390px 1fr;gap:16px;padding:0 48px 28px}.app-page{padding:30px 42px;border-top:0;min-height:850px}.workspace-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.workspace-title{display:flex;align-items:center;gap:12px;font-size:22px;font-weight:950}.workspace{display:grid;grid-template-columns:420px 1fr;gap:16px}.panel{background:rgba(17,29,49,.92);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:16px;min-width:0}.panel h2{margin:0 0 14px;font-size:18px}.table-list{display:grid;gap:8px}.table-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#1b2a41;padding:10px 10px 10px 12px;font-weight:900;cursor:pointer}.table-row:hover{border-color:rgba(255,255,255,.2);background:#23344f}.table-row.selected{border-color:var(--orange);background:linear-gradient(90deg,rgba(255,152,47,.22),#22334d)}.table-main{min-width:0}.table-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.table-meta{display:block;margin-top:4px;color:#9eb0c8;font-size:12px;font-weight:800}.table-actions{display:flex;gap:6px}.table-edit{min-height:30px;padding:0 10px;border-radius:8px;background:rgba(255,255,255,.08);font-size:12px}.table-row.editing{grid-template-columns:1fr;cursor:default}.rename-form{display:flex;gap:8px}.rename-form input{min-width:0;flex:1}.confirm-strip{border:1px solid rgba(255,211,107,.4);background:rgba(255,152,47,.12);border-radius:10px;padding:10px;margin-top:8px;color:#ffe5bc;line-height:1.5}.confirm-actions{display:flex;gap:8px;margin-top:8px}.new-table{display:flex;gap:8px;margin:12px 0}.new-table input,.rename-form input,.control textarea{width:100%;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:#0b1424;color:#edf6ff;padding:12px;font:inherit}.control textarea{min-height:230px;resize:vertical;-webkit-user-select:text;user-select:text}.youtube-tools{display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(11,20,36,.72)}.youtube-tools.open{display:flex}.youtube-tools .btn{min-height:34px;padding:0 12px;border-radius:8px;font-size:12px}.tabs,.views{display:flex;gap:8px;margin-bottom:12px}.table-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.table-tools .btn{width:96px;min-height:40px;padding:0}.candidate-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.candidate-tools .btn{width:auto;min-width:74px;min-height:34px;padding:0 10px;font-size:12px}.tab,.view{background:#26344b}.tab.active,.view.active{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#172033}.mode-note{border:1px solid rgba(69,169,255,.22);background:rgba(69,169,255,.08);border-radius:10px;padding:10px;color:#b9d8fb;line-height:1.55;margin-bottom:12px}.status{min-height:22px;color:#aac0da;margin-top:12px;line-height:1.5}.status.error{color:#ffb7c8}.status.ok{color:#aef3c7}.status.compact{font-size:12px;min-height:18px}.engine-card{margin:0 0 18px;border:1px solid rgba(255,255,255,.1);border-radius:12px;background:rgba(11,20,36,.78);padding:12px;max-width:560px}.engine-main{display:flex;align-items:center;gap:8px}.engine-dot{width:10px;height:10px;border-radius:50%;background:#9aa9bf;box-shadow:0 0 0 4px rgba(255,255,255,.05)}.engine-card.ok .engine-dot,.engine-mini.ok:before{background:var(--green)}.engine-card.warn .engine-dot,.engine-mini.warn:before{background:#ffd36b}.engine-card.error .engine-dot,.engine-mini.error:before{background:#ff6b8f}.engine-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px;color:#aabbd2;font-size:12px;font-weight:850}.engine-mini{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#0b1424;color:#b9c8dd;padding:9px 10px;margin-bottom:12px;font-size:12px;font-weight:900}.engine-mini:before{content:"";width:8px;height:8px;border-radius:50%;background:#9aa9bf}.help{margin-top:18px;color:#9eb0c8;line-height:1.7}.guide{display:grid;gap:12px;color:#dce8f7}.guide-kicker{color:#9eb0c8;margin:0}.guide-section{border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#0b1424;padding:12px}.guide-section h3{margin:0 0 8px;font-size:15px;color:#fff}.guide-section ol,.guide-section ul{margin:0;padding-left:20px}.guide-section li{margin:4px 0}.guide-badge{display:inline-flex;border-radius:999px;background:rgba(255,152,47,.16);color:#ffd9a8;padding:2px 8px;font-size:12px;font-weight:950}.results-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px}.table-scroll{overflow:auto;border:1px solid rgba(255,255,255,.09);border-radius:10px;max-height:560px;min-height:220px;resize:vertical;background:#0b1424}.result-table{border-collapse:collapse;font-size:13px;min-width:1600px;width:max-content;table-layout:fixed;-webkit-user-select:text;user-select:text}.result-table th,.result-table td{border:1px solid rgba(255,255,255,.08);padding:8px 9px;text-align:left;vertical-align:top}.result-table th{color:#aac0da;background:#203048;position:sticky;top:0;z-index:1;height:38px;white-space:nowrap;overflow:hidden}.result-table tbody tr{height:96px}.result-table tbody tr:hover{background:rgba(255,255,255,.035)}.result-table tbody tr.row-selected{background:rgba(255,152,47,.1);box-shadow:inset 3px 0 0 var(--orange)}.th-inner{display:flex;align-items:center;justify-content:space-between;gap:8px}.col-resizer{display:block;width:8px;align-self:stretch;cursor:col-resize;border-radius:99px;opacity:.55}.col-resizer:hover{background:rgba(255,152,47,.42);opacity:1}.candidate-check{width:18px;height:18px;accent-color:var(--orange);cursor:pointer}.editable-cell{min-width:0;max-height:74px;outline:0;border-radius:6px;white-space:pre-wrap;overflow:auto;line-height:1.42;cursor:text}.editable-cell.cell-short{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.editable-cell.cell-long{max-height:74px}.editable-cell:hover{background:rgba(255,255,255,.055)}.editable-cell:focus{background:#0b1424;box-shadow:0 0 0 2px rgba(255,152,47,.55);padding:4px;max-height:240px;resize:vertical;overflow:auto}.editable-cell.save-error{box-shadow:0 0 0 2px rgba(255,80,120,.65)}.copy-btn{min-height:26px;padding:0 8px;border-radius:7px;background:rgba(255,255,255,.08);font-size:12px;margin-top:6px}.cover-btn{display:block;border:0;padding:0;background:transparent;cursor:zoom-in}.cover{width:48px;height:64px;object-fit:cover;border-radius:6px;background:#0b1424}.cover:hover{box-shadow:0 0 0 2px rgba(255,152,47,.75)}.source-link{max-height:38px;overflow:hidden;color:#9ed1ff;line-height:1.35;word-break:break-all}.status-pill{display:inline-flex;border-radius:999px;padding:3px 8px;background:rgba(255,255,255,.08);font-size:12px;font-weight:900}.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}.card{border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:12px;background:#142238}.card h3{margin:8px 0;font-size:15px}.muted{color:var(--muted)}.detail{white-space:pre-wrap;line-height:1.65;background:#0b1424;border-radius:10px;padding:14px;color:#dce8f7;max-height:420px;overflow:auto;-webkit-user-select:text;user-select:text}.modal{position:fixed;inset:0;display:none;place-items:center;background:rgba(2,7,14,.76);z-index:99;padding:18px}.modal.open{display:grid}.modal-card{width:min(760px,92vw);max-height:86vh;border:1px solid rgba(255,255,255,.14);border-radius:12px;background:#101d31;box-shadow:0 20px 58px rgba(0,0,0,.5);overflow:hidden}.modal-card.compact{width:min(520px,92vw)}.modal-card.help-modal{width:min(620px,92vw)}.help-modal .modal-body{max-height:70vh;overflow:auto}.modal-head{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1)}.modal-head strong{font-size:16px}.modal-actions{display:flex;gap:6px;align-items:center}.modal-actions .btn{min-height:34px;padding:0 12px;border-radius:9px;font-size:13px}.modal-body{padding:14px;display:grid;gap:12px}.export-row{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center}.export-row select{border:1px solid rgba(255,255,255,.12);border-radius:9px;background:#0b1424;color:#edf6ff;padding:10px;font:inherit}.export-note{border-radius:10px;background:#0b1424;color:#9ed1ff;padding:10px;min-height:42px;line-height:1.45;word-break:break-all}.modal-img-wrap{display:grid;place-items:center;max-height:62vh;padding:14px;background:#081120}.modal-img-wrap img{max-width:100%;max-height:58vh;border-radius:9px;object-fit:contain}.modal-url{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:9px 12px;color:#9ed1ff;background:#142238;font-size:12px;-webkit-user-select:text;user-select:text}.modal-url span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mini-btn{min-height:28px;padding:0 8px;border-radius:7px;background:rgba(255,255,255,.08);font-size:12px;white-space:nowrap}.view-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.table-tool{min-width:72px!important;width:auto!important}.selected-count{display:inline-flex;align-items:center;min-height:30px;border-radius:999px;padding:0 10px;background:#0b1424;color:#ffdcae;font-size:12px;font-weight:950}.table-toolbar-panel{display:none;flex-basis:100%;width:100%;border:1px solid rgba(255,255,255,.09);border-radius:10px;background:#0b1424;padding:10px;margin-top:2px}.table-toolbar-panel.open{display:block}.toolbar-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}.toolbar-field{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:#142238;padding:8px 10px;font-size:12px;font-weight:900}.toolbar-field input{accent-color:var(--orange)}.toolbar-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;align-items:center}.toolbar-form input,.toolbar-form select{width:100%;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#101d31;color:#edf6ff;padding:9px;font:inherit;font-size:13px}.density-actions{display:flex;gap:8px;flex-wrap:wrap}.result-table.density-compact tbody tr{height:58px}.result-table.density-compact .editable-cell{max-height:42px}.result-table.density-relaxed tbody tr{height:132px}.result-table.density-relaxed .editable-cell{max-height:108px}.sort-mark{color:#ffd36b;font-size:11px;margin-left:4px}@media(max-width:1050px){.hero,.workspace,.home-tables{grid-template-columns:1fr}.platforms{grid-template-columns:repeat(2,1fr)}}@media(max-width:680px){body{padding:0;background:#081120}.window{border-radius:0;border:0;min-height:100vh}.hero{padding-top:22px;gap:12px}.hero h1{font-size:34px}.hero p{font-size:15px;margin-bottom:14px}.orange-stage{display:none}.platforms{grid-template-columns:1fr}.platform{min-height:150px}.hero,.platforms,.app-page,.home-tables{padding-left:14px;padding-right:14px}.home-tables{gap:12px}.workspace{gap:12px}.workspace-head{position:sticky;top:0;z-index:3;background:#081120;padding:10px 0;margin:-10px 0 12px}.control textarea{min-height:150px}.actions,.tabs{display:grid;grid-template-columns:1fr 1fr}.actions .btn,.tabs .btn{width:100%;padding:0 10px}.engine-grid{grid-template-columns:1fr}.table-shell-head{padding:12px}.table-primary-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.bitable-toolbar{overflow:auto;flex-wrap:nowrap}.bitable-toolbar .btn{white-space:nowrap}.cards{grid-template-columns:1fr}.modal{padding:10px}.modal-card{width:100%;max-height:92vh}}
 
     .results-panel{padding:0;overflow:hidden;background:#111d30}.table-shell-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px 11px;border-bottom:1px solid rgba(255,255,255,.08);background:#121f33}.table-title-block{min-width:190px}.table-title-block h2{margin:0;font-size:19px;line-height:1.2}.table-subline{display:flex;align-items:center;gap:8px;margin-top:6px}.table-subtle{color:#8fa1ba;font-size:12px;font-weight:800}.table-primary-actions{display:flex;gap:7px;align-items:center;justify-content:flex-end;flex-wrap:wrap}.table-primary-actions .btn{min-height:32px;padding:0 11px;border-radius:8px;font-size:12px}.bitable-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.08);background:#0d1829}.toolbar-group{display:flex;align-items:center;gap:4px;flex-wrap:wrap}.toolbar-divider{width:1px;height:22px;background:rgba(255,255,255,.1);margin:0 2px}.toolbar-spacer{flex:1;min-width:12px}.bitable-toolbar .btn{width:auto;min-width:0;min-height:30px;padding:0 9px;border-radius:7px;background:transparent;color:#b9c8dd;font-size:12px;font-weight:900}.bitable-toolbar .btn:hover{background:rgba(255,255,255,.07);color:#edf6ff}.bitable-toolbar .btn.primary,.bitable-toolbar .view.active,.bitable-toolbar .table-tool.primary{background:rgba(255,152,47,.16);color:#ffd6a8;box-shadow:inset 0 0 0 1px rgba(255,152,47,.22)}.export-tool{background:rgba(255,255,255,.06)!important;color:#e7f0ff!important}.selected-count{min-height:24px;padding:0 8px;background:rgba(255,152,47,.14);color:#ffd6a8}.table-toolbar-panel{margin:8px 0 0;padding:9px;background:#101d31;border-color:rgba(255,255,255,.08)}.table-scroll{border-radius:0;border-left:0;border-right:0;border-bottom:0}.result-table th{background:#1c2d45}.result-table tbody tr.row-selected{background:rgba(255,152,47,.08)}@media(max-width:900px){.table-shell-head{align-items:flex-start;flex-direction:column}.table-primary-actions{justify-content:flex-start}.toolbar-spacer{display:none}}
   </style>
 </head>
 <body>
-  <canvas class="particle-canvas" id="particleCanvas" aria-hidden="true"></canvas>
   <div class="window" id="appWindow">
     <main class="home-page" id="homePage">
     <section class="hero">
-      <div><h1><span>CHEN</span><br>一个会榨取信息的<br>橙子助手</h1><p>选择平台，粘贴作品或主页链接。需要登录时会提示打开平台页面；采集完成后直接在软件里保存、分类和导出。</p><div class="engine-card compact" id="engineStatusCard"><div class="engine-main"><span class="engine-dot"></span><strong>采集引擎检测中</strong></div><div class="engine-grid"><span>队列 -</span><span>电源 -</span><span>浏览器 -</span></div></div><div class="actions"><button class="btn primary" onclick="document.querySelector('#platforms').scrollIntoView({behavior:'smooth'})">选择平台</button><button class="btn" onclick="document.querySelector('.home-tables').scrollIntoView({behavior:'smooth'})">历史记忆</button><button class="btn daily-hero-btn" onclick="openDailyPage()">MAX口喷日报</button><strong class="muted">v0.5</strong></div></div>
+      <div><h1><span>CHEN</span><br>一个会榨取信息的<br>橙子助手</h1><p>选择平台，粘贴作品或主页链接。需要登录时会提示打开平台页面；采集完成后直接在软件里保存、分类和导出。</p><div class="engine-card" id="engineStatusCard"><div class="engine-main"><span class="engine-dot"></span><strong>采集引擎检测中</strong></div><div class="engine-grid"><span>队列 -</span><span>电源 -</span><span>浏览器 -</span></div></div><div class="actions"><button class="btn daily-hero-btn" onclick="openDailyPage()">打开外部情报口喷日报</button><button class="btn primary" onclick="document.querySelector('#platforms').scrollIntoView({behavior:'smooth'})">选择平台</button><button class="btn" onclick="document.querySelector('.home-tables').scrollIntoView({behavior:'smooth'})">历史记忆</button><strong class="muted">v0.5</strong></div></div>
       <div class="orange-stage"><div class="orange-buddy"><div class="face"><span class="eye left"></span><span class="eye right"></span><span class="cheek left"></span><span class="cheek right"></span><span class="mouth"></span></div></div><div class="juice"></div><div class="glass"></div></div>
     </section>
     <section class="platforms" id="platforms"></section>
     <section class="home-tables">
       <aside class="panel"><h2>采集表格</h2><div class="table-list" id="tables"></div><div class="new-table"><input id="tableName" placeholder="新建分类表格"><button class="btn primary" onclick="createTable()">新建</button></div><div class="status compact" id="tableStatus"></div><div class="help"><strong>表格说明</strong><br>表格负责分类保存采集结果。先选中一张表，再进入平台采集页；单作品会写成作品行，主页链接会先写成候选行，勾选后再补全。</div></aside>
-      <section class="panel results-panel"><div class="table-shell-head"><div class="table-title-block"><h2 id="homeResultTitle">表格预览</h2><div class="table-subline"><span class="selected-count">已选 0</span><span class="table-subtle">当前表格视图</span></div></div><div class="table-primary-actions"><button class="btn" onclick="selectCandidateItems()">全选当前</button><button class="btn" onclick="clearSelectedItems()">清空选择</button><button class="btn" onclick="openDailyPage()">打开今日日报</button><button class="btn primary" onclick="collectSelected(false)">采集选中</button><button class="btn primary" onclick="collectSelected(true)">选中+逐字稿</button></div></div><div class="bitable-toolbar"><div class="toolbar-group view-switch"><button class="btn view active" data-view="table" onclick="setView('table')">表格</button><button class="btn view" data-view="card" onclick="setView('card')">卡片</button><button class="btn view" data-view="detail" onclick="setView('detail')">详情</button></div><span class="toolbar-divider"></span><div class="toolbar-group"><button class="btn table-tool" onclick="toggleTableTool('fields')">字段配置</button><button class="btn table-tool" onclick="toggleTableTool('filter')">筛选</button><button class="btn table-tool" onclick="toggleTableTool('sort')">排序</button><button class="btn table-tool" onclick="toggleTableTool('density')">行高</button><button class="btn table-tool" onclick="resetTableView()">重置视图</button></div><span class="toolbar-spacer"></span><button class="btn export-tool" onclick="openExportModal()">导出表格</button><div class="table-toolbar-panel"></div></div><div id="homeResults"></div></section>
+      <section class="panel results-panel"><div class="table-shell-head"><div class="table-title-block"><h2 id="homeResultTitle">表格预览</h2><div class="table-subline"><span class="selected-count">已选 0</span><span class="table-subtle">当前表格视图</span></div></div><div class="table-primary-actions"><button class="btn" onclick="selectCandidateItems()">全选当前</button><button class="btn" onclick="clearSelectedItems()">清空选择</button><button class="btn primary" onclick="collectSelected(false)">采集选中</button><button class="btn primary" onclick="collectSelected(true)">选中+逐字稿</button></div></div><div class="bitable-toolbar"><div class="toolbar-group view-switch"><button class="btn view active" data-view="table" onclick="setView('table')">表格</button><button class="btn view" data-view="card" onclick="setView('card')">卡片</button><button class="btn view" data-view="detail" onclick="setView('detail')">详情</button></div><span class="toolbar-divider"></span><div class="toolbar-group"><button class="btn table-tool" onclick="toggleTableTool('fields')">字段配置</button><button class="btn table-tool" onclick="toggleTableTool('filter')">筛选</button><button class="btn table-tool" onclick="toggleTableTool('sort')">排序</button><button class="btn table-tool" onclick="toggleTableTool('density')">行高</button><button class="btn table-tool" onclick="resetTableView()">重置视图</button></div><span class="toolbar-spacer"></span><button class="btn export-tool" onclick="openDailyPage()">网页日报</button><button class="btn export-tool" onclick="openExportModal()">导出表格</button><div class="table-toolbar-panel"></div></div><div id="homeResults"></div></section>
     </section>
     </main>
     <section class="app-page page hidden" id="appPage">
       <div class="workspace-head"><div class="workspace-title"><span id="pageIcon" class="appicon dy"></span><span id="pageTitle">抖音扒取</span></div><button class="btn" onclick="showHome()">返回主页</button></div>
       <div class="workspace">
-        <main class="panel control"><h2 id="controlTitle">抖音扒取</h2><p class="muted" id="currentTableHint">当前表格：默认采集表</p><div class="engine-mini" id="engineMini">采集引擎检测中</div><div class="tabs"><button class="btn tab active" data-mode="single" onclick="setMode('single')">单作品链接</button><button class="btn tab" data-mode="profile" onclick="setMode('profile')">主页链接</button></div><div class="mode-note" id="modeNote"></div><textarea id="urls" placeholder="把作品链接粘贴到这里，一行一个"></textarea><div class="actions" style="margin-top:12px"><button class="btn primary" id="scrapeButton" onclick="scrape()">开始扒取</button><button class="btn primary" onclick="queueScrape()">加入队列</button><button class="btn" id="profileStop" onclick="stopProfileSession()" style="display:none">停止监听</button><button class="btn" onclick="openLogin()">登录平台</button><button class="btn" onclick="toggleYouTubeTools()">YouTube修复</button></div><div class="youtube-tools" id="youtubeTools"><button class="btn" onclick="diagnoseYouTube(false)">检查失败原因</button><button class="btn" onclick="diagnoseYouTube(true)">测试能否转写</button><button class="btn" onclick="enableYouTubePoProvider()">增强下载</button></div><div class="status" id="status">准备好了。</div></main>
-        <section class="panel results-panel"><div class="table-shell-head"><div class="table-title-block"><h2 id="resultTitle">采集结果</h2><div class="table-subline"><span class="selected-count">已选 0</span><span class="table-subtle">采集结果表</span></div></div><div class="table-primary-actions"><button class="btn" onclick="selectCandidateItems()">全选当前</button><button class="btn" onclick="clearSelectedItems()">清空选择</button><button class="btn" onclick="openDailyPage()">打开今日日报</button><button class="btn primary" onclick="collectSelected(false)">采集选中</button><button class="btn primary" onclick="collectSelected(true)">选中+逐字稿</button></div></div><div class="bitable-toolbar"><div class="toolbar-group view-switch"><button class="btn view active" data-view="table" onclick="setView('table')">表格</button><button class="btn view" data-view="card" onclick="setView('card')">卡片</button><button class="btn view" data-view="detail" onclick="setView('detail')">详情</button></div><span class="toolbar-divider"></span><div class="toolbar-group"><button class="btn table-tool" onclick="toggleTableTool('fields')">字段配置</button><button class="btn table-tool" onclick="toggleTableTool('filter')">筛选</button><button class="btn table-tool" onclick="toggleTableTool('sort')">排序</button><button class="btn table-tool" onclick="toggleTableTool('density')">行高</button><button class="btn table-tool" onclick="resetTableView()">重置视图</button></div><span class="toolbar-spacer"></span><button class="btn export-tool" onclick="openExportModal()">导出表格</button><div class="table-toolbar-panel"></div></div><div id="results"></div></section>
+        <main class="panel control"><h2 id="controlTitle">抖音扒取</h2><p class="muted" id="currentTableHint">当前表格：默认采集表</p><div class="engine-mini" id="engineMini">采集引擎检测中</div><div class="tabs"><button class="btn tab active" data-mode="single" onclick="setMode('single')">单作品链接</button><button class="btn tab" data-mode="profile" onclick="setMode('profile')">主页链接</button></div><div class="mode-note" id="modeNote"></div><textarea id="urls" placeholder="把作品链接粘贴到这里，一行一个"></textarea><div class="actions" style="margin-top:12px"><button class="btn primary" id="scrapeButton" onclick="scrape()">开始扒取</button><button class="btn primary" onclick="queueScrape()">加入队列</button><button class="btn" id="profileStop" onclick="stopProfileSession()" style="display:none">停止监听</button><button class="btn" onclick="openLogin()">打开平台浏览器</button><button class="btn" onclick="toggleYouTubeTools()">YouTube修复</button></div><div class="youtube-tools" id="youtubeTools"><button class="btn" onclick="diagnoseYouTube(false)">检查失败原因</button><button class="btn" onclick="diagnoseYouTube(true)">测试能否转写</button><button class="btn" onclick="enableYouTubePoProvider()">增强下载</button></div><div class="status" id="status">准备好了。</div></main>
+        <section class="panel results-panel"><div class="table-shell-head"><div class="table-title-block"><h2 id="resultTitle">采集结果</h2><div class="table-subline"><span class="selected-count">已选 0</span><span class="table-subtle">采集结果表</span></div></div><div class="table-primary-actions"><button class="btn" onclick="selectCandidateItems()">全选当前</button><button class="btn" onclick="clearSelectedItems()">清空选择</button><button class="btn primary" onclick="collectSelected(false)">采集选中</button><button class="btn primary" onclick="collectSelected(true)">选中+逐字稿</button></div></div><div class="bitable-toolbar"><div class="toolbar-group view-switch"><button class="btn view active" data-view="table" onclick="setView('table')">表格</button><button class="btn view" data-view="card" onclick="setView('card')">卡片</button><button class="btn view" data-view="detail" onclick="setView('detail')">详情</button></div><span class="toolbar-divider"></span><div class="toolbar-group"><button class="btn table-tool" onclick="toggleTableTool('fields')">字段配置</button><button class="btn table-tool" onclick="toggleTableTool('filter')">筛选</button><button class="btn table-tool" onclick="toggleTableTool('sort')">排序</button><button class="btn table-tool" onclick="toggleTableTool('density')">行高</button><button class="btn table-tool" onclick="resetTableView()">重置视图</button></div><span class="toolbar-spacer"></span><button class="btn export-tool" onclick="openDailyPage()">网页日报</button><button class="btn export-tool" onclick="openExportModal()">导出表格</button><div class="table-toolbar-panel"></div></div><div id="results"></div></section>
       </div>
     </section>
   </div>
@@ -1868,7 +1880,7 @@ DESKTOP_APP_HTML = r"""<!doctype html>
       <div class="modal-head"><strong>导出采集表格</strong><div class="modal-actions"><button class="btn" onclick="closeExportModal()">关闭</button></div></div>
       <div class="modal-body">
         <div class="export-row"><span class="muted">当前表格</span><strong id="exportTableName">默认采集表</strong></div>
-        <div class="export-row"><span class="muted">导出格式</span><select id="exportFormat"><option value="csv">CSV 表格</option><option value="markdown">Markdown 文档</option><option value="json">JSON 数据</option></select></div>
+        <div class="export-row"><span class="muted">导出格式</span><select id="exportFormat"><option value="max-daily">MAX 日报</option><option value="csv">CSV 表格</option><option value="markdown">Markdown 文档</option><option value="json">JSON 数据</option></select></div>
         <div class="export-note" id="exportPath">点击“选择位置并保存”，会弹出系统保存窗口。</div>
         <div class="actions"><button class="btn primary" onclick="saveExportFile()">选择位置并保存</button><button class="btn" onclick="downloadExportFile()">浏览器下载</button></div>
       </div>
@@ -1882,28 +1894,21 @@ DESKTOP_APP_HTML = r"""<!doctype html>
   </div>
 <script>
 const platforms=[['抖音','dy',['单作品链接','主页候选预览','勾选后深度采集'],'支持单条抖音作品链接；主页链接会打开专用浏览器，你手动登录并下滑主页，软件先生成候选列表，勾选后再补全数据。'],['小红书','xhs',['图文 / 视频笔记','小红书主页候选预览','勾选后深度采集'],'支持小红书图文和视频笔记；主页链接会打开专用浏览器，你手动登录并下滑主页，软件先生成候选列表，勾选后再补全数据。'],['B站','bz',['BV / av / 分享链接','B站主页候选预览','勾选后深度采集','长视频 ASR'],'支持 BV、av 和分享链接；UP主页会打开专用浏览器，你手动下滑主页，软件先生成候选列表，勾选后再补全数据或转写。'],['视频号','shipin',['单作品链接','视频号主页候选预览','勾选后深度采集','失败原因提示'],'视频号更依赖微信登录态；主页会打开专用浏览器，你扫码登录并手动下滑，软件先保存候选，勾选后再采集详情或转写。'],['YouTube','yt',['单视频 / Shorts','YouTube频道候选预览','字幕优先 / ASR兜底','勾选后深度采集'],'支持 YouTube 单视频、Shorts 和频道页；频道页先生成候选列表，勾选后再补全信息、字幕或转写。'],['Instagram','ig',['Post / Reel链接','Instagram主页候选预览','登录态采集','勾选后深度采集'],'支持 Instagram Post、Reel 和主页候选预览；需要登录时会打开平台页面，候选勾选后再深度采集。']];
-const tablePrefsVersion=4;
-const defaultColWidths=[58,74,220,92,230,320,220,82,82,82,82,142,118,142,230,260,118,94,110,180,150];
-let state={platform:'抖音',mode:'single',view:'table',tableId:'',tables:[],items:[],page:'home',editingTableId:'',deletingTableId:'',tableMessage:'',profileSessionId:'',profilePollTimer:null,selectedItems:new Set(),hiddenCols:new Set(),filters:{query:'',platform:'',status:'',daily:'',date:''},sort:{field:'updated_at',dir:'desc'},rowDensity:'normal',toolPanel:'',colWidths:[...defaultColWidths]};
-const tableColumns=['选择','封面','作品链接','平台','作品标题','文案','封面图链接','时长','点赞','评论','分享','发布时间','抓取状态','抓取时间','错误信息','MAX口喷卡片','日报日期','加入日报','日报排序','Max反馈','操作'];
-const tableFields=['select','cover','source_url','platform','title','caption','cover_url','duration','likes','comments','shares','published_at','status','updated_at','error','max_daily_card','daily_date','daily_selected','daily_sort','max_feedback','actions'];
-const multilineFields=new Set(['title','caption','error','max_daily_card','max_feedback','daily_date']);
-const enginePlatformLoginMarkers=["openLoginBrowser('抖音')","打开抖音登录浏览器","openLoginBrowser('小红书')","打开小红书登录浏览器","openLoginBrowser('B站')","打开B站登录浏览器","openLoginBrowser('视频号')","打开视频号登录浏览器","openLoginBrowser('YouTube')","打开YouTube登录浏览器","openLoginBrowser('Instagram')","打开Instagram登录浏览器"];
-let engineStatusPanelOpen=false,lastEngineStatus=null;
+const tablePrefsVersion=3;
+const defaultColWidths=[58,74,230,180,86,82,230,92,92,92,142,110,300,220,300,118];
+let state={platform:'抖音',mode:'single',view:'table',tableId:'',tables:[],items:[],page:'home',editingTableId:'',deletingTableId:'',tableMessage:'',profileSessionId:'',profilePollTimer:null,selectedItems:new Set(),hiddenCols:new Set(),filters:{query:'',platform:'',status:''},sort:{field:'updated_at',dir:'desc'},rowDensity:'normal',toolPanel:'',colWidths:[...defaultColWidths]};
+const tableColumns=['选择','封面','作品标题','来源','类型','平台','时长','点赞','评论','分享','发布时间','状态','文案/逐字稿','备注','口喷日报','操作'];
+const tableFields=['select','cover','title','source_url','source_type','platform','duration','likes','comments','shares','published_at','status','caption','error','max_daily_card','actions'];
 loadTablePrefs();
-function loadTablePrefs(){try{const raw=localStorage.getItem('chen.tablePrefs');if(!raw)return;const prefs=JSON.parse(raw);if(prefs.uiVersion!==tablePrefsVersion)return;if(Array.isArray(prefs.colWidths)&&prefs.colWidths.length===tableColumns.length)state.colWidths=prefs.colWidths.map((x,i)=>Number(x)||defaultColWidths[i]);if(Array.isArray(prefs.hiddenCols))state.hiddenCols=new Set(prefs.hiddenCols.filter(i=>i>0&&i<tableColumns.length-1));if(prefs.rowDensity)state.rowDensity=prefs.rowDensity;if(prefs.sort)state.sort={field:prefs.sort.field||'updated_at',dir:prefs.sort.dir==='asc'?'asc':'desc'};if(prefs.filters)state.filters={query:prefs.filters.query||'',platform:prefs.filters.platform||'',status:prefs.filters.status||'',daily:prefs.filters.daily||'',date:prefs.filters.date||''}}catch(e){}}
+function loadTablePrefs(){try{const raw=localStorage.getItem('chen.tablePrefs');if(!raw)return;const prefs=JSON.parse(raw);if(prefs.uiVersion!==tablePrefsVersion)return;if(Array.isArray(prefs.colWidths)&&prefs.colWidths.length===tableColumns.length)state.colWidths=prefs.colWidths.map((x,i)=>Number(x)||defaultColWidths[i]);if(Array.isArray(prefs.hiddenCols))state.hiddenCols=new Set(prefs.hiddenCols.filter(i=>i>0&&i<tableColumns.length-1));if(prefs.rowDensity)state.rowDensity=prefs.rowDensity;if(prefs.sort)state.sort={field:prefs.sort.field||'updated_at',dir:prefs.sort.dir==='asc'?'asc':'desc'};if(prefs.filters)state.filters={query:prefs.filters.query||'',platform:prefs.filters.platform||'',status:prefs.filters.status||''}}catch(e){}}
 function saveTablePrefs(){try{localStorage.setItem('chen.tablePrefs',JSON.stringify({uiVersion:tablePrefsVersion,colWidths:state.colWidths,hiddenCols:[...state.hiddenCols],rowDensity:state.rowDensity,sort:state.sort,filters:state.filters}))}catch(e){}}
 function qs(s){return document.querySelector(s)}function qsa(s){return [...document.querySelectorAll(s)]}
-function startParticleCanvas(){const canvas=qs('#particleCanvas');if(!canvas||canvas.dataset.ready)return;canvas.dataset.ready='1';const ctx=canvas.getContext('2d');let w=0,h=0,dpr=1,particles=[];function resize(){dpr=Math.min(window.devicePixelRatio||1,2);w=window.innerWidth;h=window.innerHeight;canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);canvas.style.width=w+'px';canvas.style.height=h+'px';ctx.setTransform(dpr,0,0,dpr,0,0);const count=Math.min(86,Math.max(34,Math.floor(w*h/24000)));particles=Array.from({length:count},()=>({x:Math.random()*w,y:Math.random()*h,r:Math.random()*1.8+.6,vx:(Math.random()-.5)*.22,vy:(Math.random()-.5)*.18,a:Math.random()*.42+.16}))}function tick(){ctx.clearRect(0,0,w,h);const g=ctx.createRadialGradient(w*.18,h*.1,0,w*.18,h*.1,Math.max(w,h)*.75);g.addColorStop(0,'rgba(255,152,47,.18)');g.addColorStop(.42,'rgba(69,169,255,.08)');g.addColorStop(1,'rgba(0,0,0,0)');ctx.fillStyle=g;ctx.fillRect(0,0,w,h);particles.forEach((p,i)=>{p.x+=p.vx;p.y+=p.vy;if(p.x<-20)p.x=w+20;if(p.x>w+20)p.x=-20;if(p.y<-20)p.y=h+20;if(p.y>h+20)p.y=-20;ctx.beginPath();ctx.fillStyle=`rgba(255,210,148,${p.a})`;ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();for(let j=i+1;j<particles.length;j++){const q=particles[j],dx=p.x-q.x,dy=p.y-q.y,dist=Math.hypot(dx,dy);if(dist<116){ctx.strokeStyle=`rgba(124,199,255,${(1-dist/116)*.08})`;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.stroke()}}});requestAnimationFrame(tick)}window.addEventListener('resize',resize);resize();tick()}
 async function api(path,opts={}){const res=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});if(!res.ok)throw new Error(await res.text());return res.json()}
 function engineTone(s){if(!s||!s.ok)return 'error';if((s.pending_count||0)>0||s.status==='需要登录处理')return 'warn';return 'ok'}
-function platformTone(row){if(!row)return 'error';if(row.tone)return row.tone;if((row.waiting_login_count||0)>0)return 'warn';return row.browser==='运行中'?'ok':'error'}
-function platformStatusHtml(rows){const source=Array.isArray(rows)&&rows.length?rows:platforms.map(p=>({platform:p[0],status:'等待检测',waiting_login_count:0,active_count:0,browser:'未知',tone:'error'}));return `<div class="engine-platform-grid">${source.map(row=>{const name=row.platform||'未知';const tone=platformTone(row);const waiting=row.waiting_login_count||0;const active=row.active_count||0;const detail=waiting?`待登录 ${waiting} 条 · 浏览器 ${row.browser||'未知'}`:`任务 ${active} 条 · 浏览器 ${row.browser||'未知'}`;return `<div class="engine-platform ${tone}"><div class="engine-platform-head"><span class="platform-pill">${escapeHtml(name)}</span><span>${escapeHtml(row.status||'等待检测')}</span></div><div class="engine-platform-status">${escapeHtml(detail)}</div><button class="btn" onclick="openLoginBrowser('${escapeJs(name)}')">打开${escapeHtml(name)}登录浏览器</button></div>`}).join('')}</div>`}
-function toggleEngineStatusPanel(force){engineStatusPanelOpen=typeof force==='boolean'?force:!engineStatusPanelOpen;renderEngineStatus(lastEngineStatus)}
-function renderEngineStatus(s){lastEngineStatus=s;const tone=engineTone(s);const title=s&&s.status?s.status:'采集引擎离线';const bits=s?[`队列 ${s.pending_count||0}`,`待登录 ${s.waiting_login_count||0}`,`浏览器 ${s.cdp_browser||'未知'}`]:['队列 -','待登录 -','浏览器 -'];const card=qs('#engineStatusCard');if(card){card.className='engine-card compact '+tone;card.innerHTML=`<div class="engine-compact-summary"><div class="engine-compact-title"><span class="engine-dot"></span><strong>${escapeHtml(title)}</strong></div><button class="btn" onclick="toggleEngineStatusPanel()">平台状态</button></div><div class="engine-grid">${bits.map(x=>`<span>${escapeHtml(x)}</span>`).join('')}</div><div class="engine-status-popover ${engineStatusPanelOpen?'open':''}"><div class="engine-popover-head"><strong>全平台登录状态</strong><button class="btn" onclick="toggleEngineStatusPanel(false)">收起</button></div>${platformStatusHtml(s&&s.platform_statuses)}<div class="engine-actions"><button class="btn" onclick="openLoginBrowser(state.platform)">打开登录浏览器（当前平台）</button><button class="btn" onclick="loadEngineStatus()">重新检测</button></div></div>`}const mini=qs('#engineMini');if(mini){mini.className='engine-mini '+tone;mini.textContent=s?`${title} · 队列 ${s.pending_count||0} · 待登录 ${s.waiting_login_count||0} · ${s.power_source||'未知'}`:'采集引擎离线'}}
+function renderEngineStatus(s){const tone=engineTone(s);const title=s&&s.status?s.status:'采集引擎离线';const bits=s?[`队列 ${s.pending_count||0}`,`电源 ${s.power_source||'未知'}`,`浏览器 ${s.cdp_browser||'未知'}`]:['队列 -','电源 -','浏览器 -'];const card=qs('#engineStatusCard');if(card){card.className='engine-card '+tone;card.innerHTML=`<div class="engine-main"><span class="engine-dot"></span><strong>${escapeHtml(title)}</strong></div><div class="engine-grid">${bits.map(x=>`<span>${escapeHtml(x)}</span>`).join('')}</div>`}const mini=qs('#engineMini');if(mini){mini.className='engine-mini '+tone;mini.textContent=s?`${title} · 队列 ${s.pending_count||0} · ${s.power_source||'未知'}`:'采集引擎离线'}}
 async function loadEngineStatus(){try{const s=await api('/api/engine/status');renderEngineStatus(s)}catch(e){renderEngineStatus(null)}}
 function platformData(name){return platforms.find(p=>p[0]===name)||platforms[0]}
-function douyinHelpHtml(){return `<div class="guide"><p class="guide-kicker"><span class="guide-badge">抖音教学</span>先选中一个采集表，再进入抖音扒取。结果会保存在当前表格里，可以编辑、复制、看封面和导出。</p><div class="guide-section"><h3>单个作品链接怎么抓</h3><ol><li>打开抖音作品页，复制浏览器里的作品链接。</li><li>回到软件，点“单作品链接”。</li><li>把链接粘贴到输入框里；多条链接可以一行一个。</li><li>点“开始扒取”，软件会自动补全标题、封面、时长、点赞、评论、分享、发布时间。</li><li>如果视频能拿到音频，会继续写入“文案/逐字稿”；长视频会比短视频慢一些。</li></ol></div><div class="guide-section"><h3>主页链接怎么批量抓</h3><ol><li>复制抖音博主主页链接，切到“主页链接”。</li><li>粘贴主页链接后点“开始扒取”。</li><li>软件会打开抖音专用浏览器；如果没登录，你先在弹出的页面里登录。</li><li>登录后手动向下滑主页，页面加载出哪些视频，软件就会实时发现并写进当前表格。</li><li>想结束时点“停止监听”。已发现的视频不会丢，会留在表格里。</li></ol></div><div class="guide-section"><h3>结果怎么看</h3><ul><li>“表格”适合批量检查和编辑；“卡片”适合看封面；“详情”适合看长文案。</li><li>封面可以点开放大，也可以保存到本地。</li><li>单元格里的标题、文案、状态、备注都可以直接点进去编辑。</li><li>右上角“导出表格”可以把当前采集表保存成 CSV、Markdown 或 JSON。</li></ul></div><div class="guide-section"><h3>常见情况</h3><ul><li>提示需要登录：点“登录平台”，登录完成后再重试。</li><li>主页批量没有新增：确认你粘贴的是主页链接，并且在弹出的抖音主页里继续下滑加载作品。</li><li>逐字稿没立刻出现：通常是音频转写排队或平台没有直接字幕，等状态更新即可。</li><li>某条失败：看“备注”列，里面会写具体失败原因。</li></ul></div></div>`}
+function douyinHelpHtml(){return `<div class="guide"><p class="guide-kicker"><span class="guide-badge">抖音教学</span>先选中一个采集表，再进入抖音扒取。结果会保存在当前表格里，可以编辑、复制、看封面和导出。</p><div class="guide-section"><h3>单个作品链接怎么抓</h3><ol><li>打开抖音作品页，复制浏览器里的作品链接。</li><li>回到软件，点“单作品链接”。</li><li>把链接粘贴到输入框里；多条链接可以一行一个。</li><li>点“开始扒取”，软件会自动补全标题、封面、时长、点赞、评论、分享、发布时间。</li><li>如果视频能拿到音频，会继续写入“文案/逐字稿”；长视频会比短视频慢一些。</li></ol></div><div class="guide-section"><h3>主页链接怎么批量抓</h3><ol><li>复制抖音博主主页链接，切到“主页链接”。</li><li>粘贴主页链接后点“开始扒取”。</li><li>软件会打开抖音专用浏览器；如果没登录，你先在弹出的页面里登录。</li><li>登录后手动向下滑主页，页面加载出哪些视频，软件就会实时发现并写进当前表格。</li><li>想结束时点“停止监听”。已发现的视频不会丢，会留在表格里。</li></ol></div><div class="guide-section"><h3>结果怎么看</h3><ul><li>“表格”适合批量检查和编辑；“卡片”适合看封面；“详情”适合看长文案。</li><li>封面可以点开放大，也可以保存到本地。</li><li>单元格里的标题、文案、状态、备注都可以直接点进去编辑。</li><li>右上角“导出表格”可以把当前采集表保存成 CSV、Markdown 或 JSON。</li></ul></div><div class="guide-section"><h3>常见情况</h3><ul><li>提示需要登录：点“打开平台浏览器”，如果页面确实退出登录，再完成登录。</li><li>提示浏览器未就绪：重新点“打开平台浏览器”或关闭专用浏览器后再试，不代表账号掉线。</li><li>主页批量没有新增：确认你粘贴的是主页链接，并且在弹出的抖音主页里继续下滑加载作品。</li><li>逐字稿没立刻出现：通常是音频转写排队或平台没有直接字幕，等状态更新即可。</li><li>某条失败：看“备注”列，里面会写具体失败原因。</li></ul></div></div>`}
 function platformHelpHtml(p){if(p==='抖音')return douyinHelpHtml();const info=platformData(p);return `<div class="guide"><p class="guide-kicker"><span class="guide-badge">${escapeHtml(p)}帮助</span>${escapeHtml(info[3])}</p><div class="guide-section"><h3>单个作品怎么抓</h3><ol><li>复制${escapeHtml(p)}单个作品链接。</li><li>回到软件，点“单作品链接”。</li><li>把链接粘贴到输入框里；多条链接可以一行一个。</li><li>点“开始扒取”，完成后在右侧表格查看结果。</li></ol></div><div class="guide-section"><h3>主页怎么批量抓</h3><ol><li>复制${escapeHtml(p)}主页链接，切到“主页链接”。</li><li>点“扫描主页”，软件会打开${escapeHtml(p)}专用浏览器。</li><li>如果需要登录，先在弹出的页面里登录。</li><li>手动向下滑主页，页面加载出哪些作品，软件就会先写入候选。</li><li>回到软件勾选候选，再点“采集选中”或“选中+逐字稿”。</li></ol></div><div class="guide-section"><h3>结果怎么看</h3><ul><li>表格、卡片、详情三种视图都可用。</li><li>封面可以点开放大，也可以保存。</li><li>表格文字可以编辑和复制，右上角可导出 CSV、Markdown 或 JSON。</li></ul></div></div>`}
 function renderPlatforms(){qs('#platforms').innerHTML=platforms.map(p=>`<div class="platform ${p[0]===state.platform?'selected':''}" onclick="selectPlatform('${p[0]}')"><div class="platform-head"><span class="appicon ${p[1]}"></span>${p[0]}扒取</div><ul>${p[2].map(x=>`<li class="${x.includes('规划中')?'pending':''}">${x}</li>`).join('')}</ul><div class="platform-actions"><button class="btn" onclick="event.stopPropagation();showPlatformHelp('${p[0]}')">帮助</button><button class="btn primary" onclick="event.stopPropagation();enterPlatform('${p[0]}')">采集</button></div></div>`).join('')}
 function selectPlatform(p){state.platform=p;renderPlatforms()}
@@ -1926,56 +1931,48 @@ async function confirmDelete(id){try{const r=await api('/api/tables/delete',{met
 function cancelTableAction(){state.editingTableId='';state.deletingTableId='';renderTables()}
 async function loadItems(){if(!state.tableId)return;state.items=await api('/api/items?table_id='+encodeURIComponent(state.tableId));state.selectedItems=new Set([...state.selectedItems].filter(id=>state.items.some(i=>i.id===id)));renderTables();renderItems()}
 function visibleColumns(){return tableColumns.map((_,i)=>i).filter(i=>!state.hiddenCols.has(i))}
-function filteredItems(){const q=(state.filters.query||'').trim().toLowerCase();return state.items.filter(i=>{if(state.filters.platform&&i.platform!==state.filters.platform)return false;if(state.filters.status&&i.status!==state.filters.status)return false;if(state.filters.daily==='yes'&&Number(i.daily_selected||0)!==1)return false;if(state.filters.daily==='no'&&Number(i.daily_selected||0)===1)return false;if(state.filters.date&&String(i.daily_date||'')!==state.filters.date)return false;if(!q)return true;return ['title','source_url','caption','cover_url','error','status','platform','daily_date','max_daily_card','max_feedback'].some(k=>String(i[k]??'').toLowerCase().includes(q))})}
-function sortedItems(){const rows=[...filteredItems()];const field=state.sort.field||'updated_at';const dir=state.sort.dir==='asc'?1:-1;const numeric=new Set(['likes','comments','shares','daily_selected','daily_sort']);rows.sort((a,b)=>{let av=a[field],bv=b[field];if(numeric.has(field)){av=Number(av||0);bv=Number(bv||0);return (av-bv)*dir}av=String(av??'');bv=String(bv??'');return av.localeCompare(bv,'zh-Hans-CN',{numeric:true})*dir});return rows}
-function resultHtml(){const rows=sortedItems();if(state.view==='card')return rows.length?'<div class="cards">'+rows.map(cardHtml).join('')+'</div>':'<p class="muted">当前筛选下没有卡片。</p>';if(state.view==='detail'){const it=rows[0];return it?`<div class="detail">${escapeHtml(it.caption||it.error||'暂无详情')}</div>`:'<p class="muted">当前筛选下没有详情。</p>'}const cols=visibleColumns();return `<div class="table-scroll"><table class="result-table density-${state.rowDensity} ${tableWidthClass()}">${tableColgroup()}<thead><tr>${tableHeader()}</tr></thead><tbody>${rows.length?rows.map(rowHtml).join(''):`<tr><td colspan="${cols.length}" class="muted">当前筛选下没有采集结果。</td></tr>`}</tbody></table></div>`}
-function tableWidthClass(){return visibleColumns().length<=4?'table-fit-panel':''}
+function filteredItems(){const q=(state.filters.query||'').trim().toLowerCase();return state.items.filter(i=>{if(state.filters.platform&&i.platform!==state.filters.platform)return false;if(state.filters.status&&i.status!==state.filters.status)return false;if(!q)return true;return ['title','source_url','caption','error','status','platform'].some(k=>String(i[k]??'').toLowerCase().includes(q))})}
+function sortedItems(){const rows=[...filteredItems()];const field=state.sort.field||'updated_at';const dir=state.sort.dir==='asc'?1:-1;const numeric=new Set(['likes','comments','shares']);rows.sort((a,b)=>{let av=a[field],bv=b[field];if(numeric.has(field)){av=Number(av||0);bv=Number(bv||0);return (av-bv)*dir}av=String(av??'');bv=String(bv??'');return av.localeCompare(bv,'zh-Hans-CN',{numeric:true})*dir});return rows}
+function resultHtml(){const rows=sortedItems();if(state.view==='card')return rows.length?'<div class="cards">'+rows.map(cardHtml).join('')+'</div>':'<p class="muted">当前筛选下没有卡片。</p>';if(state.view==='detail'){const it=rows[0];return it?`<div class="detail">${escapeHtml(it.caption||it.error||'暂无详情')}</div>`:'<p class="muted">当前筛选下没有详情。</p>'}const cols=visibleColumns();return `<div class="table-scroll"><table class="result-table density-${state.rowDensity}">${tableColgroup()}<thead><tr>${tableHeader()}</tr></thead><tbody>${rows.length?rows.map(rowHtml).join(''):`<tr><td colspan="${cols.length}" class="muted">当前筛选下没有采集结果。</td></tr>`}</tbody></table></div>`}
 function renderItems(){const html=resultHtml();if(qs('#results'))qs('#results').innerHTML=html;if(qs('#homeResults'))qs('#homeResults').innerHTML=html;renderTablePanels();updateSelectedCount()}
 function tableColgroup(){return '<colgroup>'+visibleColumns().map(i=>`<col style="width:${state.colWidths[i]||120}px">`).join('')+'</colgroup>'}
 function tableHeader(){return visibleColumns().map(i=>{const name=tableColumns[i];const mark=state.sort.field===tableFields[i]?`<span class="sort-mark">${state.sort.dir==='asc'?'↑':'↓'}</span>`:'';return `<th><div class="th-inner"><span onclick="sortByColumn(${i})">${name}${mark}</span><span class="col-resizer" onmousedown="startColumnResize(event,${i})"></span></div></th>`}).join('')}
 function startColumnResize(event,index){event.preventDefault();event.stopPropagation();const startX=event.clientX;const startWidth=state.colWidths[index]||120;document.body.style.cursor='col-resize';document.body.style.userSelect='none';function move(e){state.colWidths[index]=Math.max(58,Math.min(520,startWidth+e.clientX-startX));const visibleIndex=visibleColumns().indexOf(index)+1;qsa(`.result-table col:nth-child(${visibleIndex})`).forEach(col=>col.style.width=state.colWidths[index]+'px')}function up(){document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up);document.body.style.cursor='';document.body.style.userSelect='';saveTablePrefs()}document.addEventListener('mousemove',move);document.addEventListener('mouseup',up)}
-function rowHtml(i){const selected=state.selectedItems.has(i.id)?' row-selected':'';const dailyOn=Number(i.daily_selected||0);const cells=[selectHtml(i),coverHtml(i.cover_url),`<div class="source-link" title="${escapeAttr(i.source_url||'')}">${escapeHtml(i.source_url||'')}</div><button class="btn copy-btn" onclick="copyText('${escapeJs(i.source_url||'')}')">复制</button>`,editableCell(i,'platform'),editableCell(i,'title'),editableCell(i,'caption'),`<div class="source-link" title="${escapeAttr(i.cover_url||'')}">${escapeHtml(i.cover_url||'')}</div><button class="btn copy-btn" onclick="copyText('${escapeJs(i.cover_url||'')}')">复制</button>`,editableCell(i,'duration'),editableCell(i,'likes'),editableCell(i,'comments'),editableCell(i,'shares'),editableCell(i,'published_at'),editableCell(i,'status','status-pill'),escapeHtml(i.updated_at||''),editableCell(i,'error'),editableCell(i,'max_daily_card'),dailyDateHtml(i),`<span class="status-pill ${dailyOn?'daily-on':''}">${dailyOn?'已录入':'未录入'}</span>`,editableCell(i,'daily_sort'),editableCell(i,'max_feedback'),dailyActionHtml(i)];return `<tr class="${selected}" data-item="${escapeAttr(i.id||'')}">${visibleColumns().map(index=>`<td>${cells[index]}</td>`).join('')}</tr>`}
+function rowHtml(i){const selected=state.selectedItems.has(i.id)?' row-selected':'';const id=escapeAttr(i.id||'');const cells=[selectHtml(i),coverHtml(i.cover_url),editableCell(i,'title'),`<div class="source-link" title="${escapeAttr(i.source_url||'')}">${escapeHtml(i.source_url||'')}</div><button class="btn copy-btn" onclick="copyText('${escapeJs(i.source_url||'')}')">复制</button>`,i.source_type==='profile'?'主页批量':'单作品',editableCell(i,'platform'),editableCell(i,'duration'),editableCell(i,'likes'),editableCell(i,'comments'),editableCell(i,'shares'),editableCell(i,'published_at'),editableCell(i,'status','status-pill'),editableCell(i,'caption'),editableCell(i,'error'),editableCell(i,'max_daily_card'),`<button class="btn copy-btn" onclick="copyRow('${id}')">复制整行</button><button class="btn copy-btn" onclick="addRowToDaily('${id}')">录入日报</button><button class="btn copy-btn" onclick="removeRowFromDaily('${id}')">删除日报</button><button class="btn copy-btn" onclick="saveVideoFile('${id}')">下载视频</button>`];return `<tr class="${selected}" data-item="${id}">${visibleColumns().map(index=>`<td>${cells[index]}</td>`).join('')}</tr>`}
 function selectHtml(i){const id=escapeAttr(i.id||'');const checked=state.selectedItems.has(i.id)?'checked':'';return `<input class="candidate-check" type="checkbox" ${checked} onchange="toggleSelectedItem('${id}',this.checked)" title="勾选后可采集选中">`}
-function cardHtml(i){const id=escapeAttr(i.id||'');const dailyOn=Number(i.daily_selected||0);return `<div class="card">${coverHtml(i.cover_url)}<h3>${escapeHtml(i.title||'未命名')}</h3><p class="muted">${escapeHtml(i.platform||'')} · ${i.source_type==='profile'?'主页批量':'单作品'} · ${escapeHtml(i.status||'')} · ${dailyOn?'已录入 '+escapeHtml(i.daily_date||todayText()):'未录入日报'}</p><p>${escapeHtml((i.caption||i.error||'').slice(0,90))}</p>${dailyActionHtml(i)}</div>`}
-function dailyDateHtml(i){if(Number(i.daily_selected||0))return `<span class="status-pill">${escapeHtml(i.daily_date||todayText())}</span>`;return '<span class="muted">未加入</span>'}
-function dailyActionHtml(i){const id=escapeAttr(i.id||'');if(Number(i.daily_selected||0)){const date=escapeHtml(i.daily_date||todayText());return `<div class="daily-action"><span class="status-pill daily-on">已录入 ${date}</span><div class="daily-action-row"><button class="btn copy-btn danger" onclick="toggleDaily('${id}',0)">删除日报</button><button class="btn copy-btn" onclick="copyRow('${id}')">复制整行</button><button class="btn copy-btn" onclick="saveVideoFile('${id}')">下载视频</button></div></div>`}return `<div class="daily-action"><div class="daily-action-row"><button class="btn copy-btn primary" onclick="toggleDaily('${id}',1)">录入日报</button><button class="btn copy-btn" onclick="copyRow('${id}')">复制整行</button><button class="btn copy-btn" onclick="saveVideoFile('${id}')">下载视频</button></div></div>`}
-function editableCell(item,field,extra=''){const raw=item[field];const value=raw===null||raw===undefined?'':String(raw);const kind=multilineFields.has(field)?'cell-long':'cell-short';return `<div class="editable-cell ${kind} ${extra}" contenteditable="true" spellcheck="false" data-item="${escapeAttr(item.id||'')}" data-field="${field}" onfocus="this.dataset.before=this.innerText" onblur="saveCell(this)">${escapeHtml(value)}</div>`}
+function cardHtml(i){const id=escapeAttr(i.id||'');return `<div class="card">${coverHtml(i.cover_url)}<h3>${escapeHtml(i.title||'未命名')}</h3><p class="muted">${escapeHtml(i.platform||'')} · ${i.source_type==='profile'?'主页批量':'单作品'} · ${escapeHtml(i.status||'')}</p><p>${escapeHtml((i.caption||i.error||'').slice(0,90))}</p><button class="btn copy-btn" onclick="copyRow('${id}')">复制这条</button><button class="btn copy-btn" onclick="saveVideoFile('${id}')">下载视频</button></div>`}
+function editableCell(item,field,extra=''){const raw=item[field];const value=raw===null||raw===undefined?'':String(raw);const kind=['caption','error','title','max_daily_card'].includes(field)?'cell-long':'cell-short';return `<div class="editable-cell ${kind} ${extra}" contenteditable="true" spellcheck="false" data-item="${escapeAttr(item.id||'')}" data-field="${field}" onfocus="this.dataset.before=this.innerText" onblur="saveCell(this)">${escapeHtml(value)}</div>`}
 function coverHtml(url){if(!url)return '';const safe=escapeAttr(url);return `<button class="cover-btn" onclick="openCover('${escapeJs(url)}')" title="点击放大封面"><img class="cover" src="${coverProxy(url)}" alt="封面"></button>`}
 function setStatus(text,type=''){const el=qs('#status');if(!el)return;el.textContent=text;el.className='status '+type}
 function setTableFeedback(text,type=''){state.tableMessage=text;if(qs('#tableStatus'))qs('#tableStatus').textContent=text;setStatus(text,type)}
 function coverProxy(url,download=false){return '/api/cover?url='+encodeURIComponent(url)+(download?'&download=1':'')}
 async function saveCell(el){const itemId=el.dataset.item||'';const field=el.dataset.field||'';const value=el.innerText.trim();if(value===(el.dataset.before||''))return;try{await api('/api/items/update',{method:'POST',body:JSON.stringify({item_id:itemId,updates:{[field]:value}})});el.dataset.before=value;el.classList.remove('save-error');state.tableMessage='已保存单元格修改。';if(qs('#tableStatus'))qs('#tableStatus').textContent=state.tableMessage;const item=state.items.find(x=>x.id===itemId);if(item)item[field]=value}catch(e){el.classList.add('save-error');setStatus('保存失败：'+e.message,'error')}}
 async function copyText(text){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text)}else{const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}setStatus('已复制。','ok')}catch(e){setStatus('复制失败，请手动选中文字复制。','error')}}
-function copyRow(id){const i=state.items.find(x=>x.id===id);if(!i)return;const text=['作品链接: '+(i.source_url||''),'平台: '+(i.platform||''),'作品标题: '+(i.title||''),'文案: '+(i.caption||''),'封面图链接: '+(i.cover_url||''),'时长: '+(i.duration||''),'点赞: '+(i.likes??''),'评论: '+(i.comments??''),'分享: '+(i.shares??''),'发布时间: '+(i.published_at||''),'抓取状态: '+(i.status||''),'抓取时间: '+(i.updated_at||''),'错误信息: '+(i.error||''),'MAX口喷卡片: '+(i.max_daily_card||''),'日报日期: '+(i.daily_date||''),'Max反馈: '+(i.max_feedback||'')].join('\n');copyText(text)}
+function copyRow(id){const i=state.items.find(x=>x.id===id);if(!i)return;const text=['平台: '+(i.platform||''),'作品链接: '+(i.source_url||''),'作品标题: '+(i.title||''),'文案/逐字稿: '+(i.caption||''),'口喷日报: '+(i.max_daily_card||''),'封面图链接: '+(i.cover_url||''),'时长: '+(i.duration||''),'点赞: '+(i.likes??''),'评论: '+(i.comments??''),'分享: '+(i.shares??''),'发布时间: '+(i.published_at||''),'状态: '+(i.status||''),'备注: '+(i.error||'')].join('\\n');copyText(text)}
 function openCover(url){const modal=qs('#coverModal');modal.dataset.url=url;qs('#coverLarge').src=coverProxy(url);qs('#coverUrlText').textContent=url;modal.classList.add('open')}
 function closeCover(event){if(event&&event.target&&event.target.id!=='coverModal')return;const modal=qs('#coverModal');if(!modal)return;modal.classList.remove('open');qs('#coverLarge').removeAttribute('src')}
 function currentCoverUrl(){const modal=qs('#coverModal');return (modal&&modal.dataset.url)||''}
-function openExportModal(){if(!state.tableId){state.tableMessage='请先选择或新建采集表。';renderTables();return}const t=currentTable();qs('#exportTableName').textContent=t?t.name:'当前采集表';qs('#exportPath').textContent='点击“选择位置并保存”，会弹出系统保存窗口。';qs('#exportModal').classList.add('open')}
+function openExportModal(){if(!state.tableId){state.tableMessage='请先选择或新建采集表。';renderTables();return}const t=currentTable();qs('#exportTableName').textContent=t?t.name:'当前采集表';qs('#exportPath').textContent='默认会生成可直接给 Max 阅读的 Markdown 日报。';qs('#exportModal').classList.add('open')}
 function closeExportModal(event){if(event&&event.target&&event.target.id!=='exportModal')return;const modal=qs('#exportModal');if(modal)modal.classList.remove('open')}
-async function saveExportFile(){if(!state.tableId)return;const fmt=(qs('#exportFormat')&&qs('#exportFormat').value)||'csv';const note=qs('#exportPath');try{note.textContent='正在打开保存窗口...';const r=await api('/api/export/save',{method:'POST',body:JSON.stringify({table_id:state.tableId,format:fmt})});note.textContent='已保存到：'+r.path;setStatus('表格已导出。','ok')}catch(e){note.textContent='导出失败：'+e.message;setStatus('导出失败：'+e.message,'error')}}
-function downloadExportFile(){if(!state.tableId)return;const fmt=(qs('#exportFormat')&&qs('#exportFormat').value)||'csv';location.href='/api/export?table_id='+encodeURIComponent(state.tableId)+'&format='+encodeURIComponent(fmt)}
+async function saveExportFile(){if(!state.tableId)return;const fmt=(qs('#exportFormat')&&qs('#exportFormat').value)||'max-daily';const note=qs('#exportPath');try{note.textContent='正在打开保存窗口...';const r=await api('/api/export/save',{method:'POST',body:JSON.stringify({table_id:state.tableId,format:fmt})});note.textContent='已保存到：'+r.path;setStatus(fmt==='max-daily'?'MAX 日报已生成。':'表格已导出。','ok')}catch(e){note.textContent='导出失败：'+e.message;setStatus('导出失败：'+e.message,'error')}}
+function downloadExportFile(){if(!state.tableId)return;const fmt=(qs('#exportFormat')&&qs('#exportFormat').value)||'max-daily';location.href='/api/export?table_id='+encodeURIComponent(state.tableId)+'&format='+encodeURIComponent(fmt)}
+function openDailyPage(){const path=state.tableId?'/daily?table_id='+encodeURIComponent(state.tableId):'/daily';window.location.href=path}
 async function openCoverOriginal(){const url=currentCoverUrl();if(!url)return;try{await api('/api/open-url',{method:'POST',body:JSON.stringify({url})});setStatus('已用系统浏览器打开原图。','ok')}catch(e){setStatus('打开原图失败：'+e.message,'error')}}
 async function saveCoverFile(){const url=currentCoverUrl();if(!url)return;const text=qs('#coverUrlText');try{text.textContent='正在保存封面...';const r=await api('/api/cover/save',{method:'POST',body:JSON.stringify({url,platform:state.platform})});text.textContent='已保存到：'+r.path;setStatus('封面已保存到下载目录。','ok')}catch(e){text.textContent=url;setStatus('保存封面失败：'+e.message,'error')}}
 async function saveVideoFile(id){if(!id)return;try{setStatus('正在下载视频，长视频会多等一会儿...');const r=await api('/api/video/save',{method:'POST',body:JSON.stringify({item_id:id})});setStatus('视频已保存到：'+r.path,'ok')}catch(e){setStatus('下载视频失败：'+e.message,'error')}}
-function todayText(){const d=new Date();const m=String(d.getMonth()+1).padStart(2,'0');const day=String(d.getDate()).padStart(2,'0');return `${d.getFullYear()}-${m}-${day}`}
-function dailyPageUrl(){return '/daily?date='+encodeURIComponent(todayText())}
-function openDailyPage(){window.location.href=dailyPageUrl()}
-async function toggleDaily(id,force){const item=state.items.find(x=>x.id===id);if(!item)return;const next=force===0||force===1?force:(Number(item.daily_selected||0)?0:1);try{const updates={daily_selected:next,daily_date:next?todayText():'',daily_sort:next?Date.now():0};const updated=await api('/api/items/update',{method:'POST',body:JSON.stringify({item_id:id,updates})});Object.assign(item,updated);renderItems();setTableFeedback(next?'已录入今日日报。':'已从日报删除。','ok')}catch(e){setTableFeedback('日报状态保存失败：'+e.message,'error')}}
-async function openLoginBrowser(platform){const target=platform||state.platform||'抖音';try{setStatus('正在打开'+target+'登录浏览器...');const r=await api('/api/browser/login',{method:'POST',body:JSON.stringify({platform:target})});setStatus(r.message||'已打开'+target+'登录浏览器，请完成登录后重新检测。','ok');setTimeout(loadEngineStatus,1200)}catch(e){setStatus('打开'+target+'登录浏览器失败：'+e.message,'error')}}
 function copyCurrentCoverUrl(){copyText(currentCoverUrl())}
 function tableUnique(field){return [...new Set(state.items.map(i=>String(i[field]??'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-Hans-CN',{numeric:true}))}
-function tablePanelHtml(){if(!state.toolPanel)return '';if(state.toolPanel==='fields')return `<div class="toolbar-panel-head"><strong>飞书字段配置</strong><span>字段名按飞书多维表字段对齐，勾选后立即控制下方表格。</span><button class="btn" onclick="setColumnPreset('all')">显示全部</button><button class="btn" onclick="setColumnPreset('core')">核心字段</button><button class="btn" onclick="setColumnPreset('daily')">日报字段</button></div><div class="toolbar-grid feishu-fields">${tableColumns.map((name,i)=>`<label class="toolbar-field"><input type="checkbox" ${state.hiddenCols.has(i)?'':'checked'} ${i===0||i===tableColumns.length-1?'disabled':''} onchange="setColumnVisible(${i},this.checked)"><span>${name}</span></label>`).join('')}</div>`;if(state.toolPanel==='filter'){const platforms=tableUnique('platform').map(v=>`<option value="${escapeAttr(v)}" ${state.filters.platform===v?'selected':''}>${escapeHtml(v)}</option>`).join('');const statuses=tableUnique('status').map(v=>`<option value="${escapeAttr(v)}" ${state.filters.status===v?'selected':''}>${escapeHtml(v)}</option>`).join('');const dates=tableUnique('daily_date').map(v=>`<option value="${escapeAttr(v)}" ${state.filters.date===v?'selected':''}>${escapeHtml(v)}</option>`).join('');return `<div class="toolbar-panel-head"><strong>筛选</strong><span>搜索、平台、抓取状态、日报状态会实时控制下方表格。</span></div><div class="toolbar-form"><input placeholder="搜索作品标题、作品链接、文案、错误信息、口喷卡片" value="${escapeAttr(state.filters.query)}" oninput="setFilter('query',this.value)"><select onchange="setFilter('platform',this.value)"><option value="">全部平台</option>${platforms}</select><select onchange="setFilter('status',this.value)"><option value="">全部抓取状态</option>${statuses}</select><select onchange="setFilter('daily',this.value)"><option value="">全部日报状态</option><option value="yes" ${state.filters.daily==='yes'?'selected':''}>已加入日报</option><option value="no" ${state.filters.daily==='no'?'selected':''}>未加入日报</option></select><select onchange="setFilter('date',this.value)"><option value="">全部日报日期</option>${dates}</select><button class="btn" onclick="clearFilters()">清空筛选</button></div>`}if(state.toolPanel==='sort')return `<div class="toolbar-panel-head"><strong>排序</strong><span>也可以直接点击表头切换升降序。</span></div><div class="toolbar-form"><select onchange="setSort(this.value,state.sort.dir)">${tableFields.map((field,i)=>field==='select'||field==='cover'||field==='actions'?'':`<option value="${field}" ${state.sort.field===field?'selected':''}>${tableColumns[i]}</option>`).join('')}</select><select onchange="setSort(state.sort.field,this.value)"><option value="desc" ${state.sort.dir==='desc'?'selected':''}>降序</option><option value="asc" ${state.sort.dir==='asc'?'selected':''}>升序</option></select></div>`;if(state.toolPanel==='density')return `<div class="toolbar-panel-head"><strong>行高</strong><span>调整内容密度，适合快速扫表或阅读长文案。</span></div><div class="density-actions"><button class="btn ${state.rowDensity==='compact'?'primary':''}" onclick="setRowDensity('compact')">紧凑</button><button class="btn ${state.rowDensity==='normal'?'primary':''}" onclick="setRowDensity('normal')">标准</button><button class="btn ${state.rowDensity==='relaxed'?'primary':''}" onclick="setRowDensity('relaxed')">宽松</button></div>`;return ''}
+function tablePanelHtml(){if(!state.toolPanel)return '';if(state.toolPanel==='fields')return `<div class="toolbar-grid">${tableColumns.map((name,i)=>`<label class="toolbar-field"><input type="checkbox" ${state.hiddenCols.has(i)?'':'checked'} ${i===0||i===tableColumns.length-1?'disabled':''} onchange="setColumnVisible(${i},this.checked)"> ${name}</label>`).join('')}</div>`;if(state.toolPanel==='filter'){const platforms=tableUnique('platform').map(v=>`<option value="${escapeAttr(v)}" ${state.filters.platform===v?'selected':''}>${escapeHtml(v)}</option>`).join('');const statuses=tableUnique('status').map(v=>`<option value="${escapeAttr(v)}" ${state.filters.status===v?'selected':''}>${escapeHtml(v)}</option>`).join('');return `<div class="toolbar-form"><input placeholder="搜索标题、链接、文案、备注" value="${escapeAttr(state.filters.query)}" oninput="setFilter('query',this.value)"><select onchange="setFilter('platform',this.value)"><option value="">全部平台</option>${platforms}</select><select onchange="setFilter('status',this.value)"><option value="">全部状态</option>${statuses}</select><button class="btn" onclick="clearFilters()">清空筛选</button></div>`}if(state.toolPanel==='sort')return `<div class="toolbar-form"><select onchange="setSort(this.value,state.sort.dir)">${tableFields.map((field,i)=>field==='select'||field==='cover'||field==='actions'?'':`<option value="${field}" ${state.sort.field===field?'selected':''}>${tableColumns[i]}</option>`).join('')}</select><select onchange="setSort(state.sort.field,this.value)"><option value="desc" ${state.sort.dir==='desc'?'selected':''}>降序</option><option value="asc" ${state.sort.dir==='asc'?'selected':''}>升序</option></select></div>`;if(state.toolPanel==='density')return `<div class="density-actions"><button class="btn ${state.rowDensity==='compact'?'primary':''}" onclick="setRowDensity('compact')">紧凑</button><button class="btn ${state.rowDensity==='normal'?'primary':''}" onclick="setRowDensity('normal')">标准</button><button class="btn ${state.rowDensity==='relaxed'?'primary':''}" onclick="setRowDensity('relaxed')">宽松</button></div>`;return ''}
 function renderTablePanels(){const label=toolPanelLabel();qsa('.table-toolbar-panel').forEach(el=>{el.innerHTML=tablePanelHtml();el.classList.toggle('open',!!state.toolPanel)});qsa('.table-tool').forEach(btn=>btn.classList.toggle('primary',!!label&&btn.textContent.includes(label)))}
 function toolPanelLabel(){return {fields:'字段配置',filter:'筛选',sort:'排序',density:'行高'}[state.toolPanel]||''}
 function toggleTableTool(panel){state.toolPanel=state.toolPanel===panel?'':panel;renderTablePanels()}
-function setColumnVisible(index,visible){if(index===0||index===tableColumns.length-1)return;if(visible)state.hiddenCols.delete(index);else state.hiddenCols.add(index);saveTablePrefs();renderItems()}
-function setColumnPreset(preset){const always=new Set([0,tableColumns.length-1]);const core=new Set([0,1,2,3,4,5,7,8,9,10,11,12,14,16,20]);const daily=new Set([0,1,2,3,4,5,12,15,16,17,18,19,20]);state.hiddenCols=new Set();if(preset!=='all'){tableColumns.forEach((_,i)=>{const keep=preset==='daily'?daily:core;if(!keep.has(i)&&!always.has(i))state.hiddenCols.add(i)})}saveTablePrefs();renderItems();setTableFeedback(preset==='all'?'已显示全部飞书字段。':preset==='daily'?'已切换到日报字段视图。':'已切换到核心字段视图。','ok')}
+function setColumnVisible(index,visible){if(visible)state.hiddenCols.delete(index);else state.hiddenCols.add(index);saveTablePrefs();renderItems()}
 function setFilter(field,value){state.filters={...state.filters,[field]:value};saveTablePrefs();renderItems()}
-function clearFilters(){state.filters={query:'',platform:'',status:'',daily:'',date:''};saveTablePrefs();renderItems();setTableFeedback('已清空筛选。','ok')}
+function clearFilters(){state.filters={query:'',platform:'',status:''};saveTablePrefs();renderItems();setTableFeedback('已清空筛选。','ok')}
 function setSort(field,dir){state.sort={field:field||'updated_at',dir:dir==='asc'?'asc':'desc'};saveTablePrefs();renderItems()}
 function sortByColumn(index){const field=tableFields[index];if(['select','cover','actions'].includes(field))return;const dir=state.sort.field===field&&state.sort.dir==='desc'?'asc':'desc';setSort(field,dir)}
 function setRowDensity(value){state.rowDensity=value;saveTablePrefs();renderItems()}
-function resetTableView(){state.hiddenCols=new Set();state.filters={query:'',platform:'',status:'',daily:'',date:''};state.sort={field:'updated_at',dir:'desc'};state.rowDensity='normal';state.colWidths=[...defaultColWidths];state.toolPanel='';saveTablePrefs();renderItems();setTableFeedback('已重置当前表格视图。','ok')}
+function resetTableView(){state.hiddenCols=new Set();state.filters={query:'',platform:'',status:''};state.sort={field:'updated_at',dir:'desc'};state.rowDensity='normal';state.colWidths=[...defaultColWidths];state.toolPanel='';saveTablePrefs();renderItems();setTableFeedback('已重置当前表格视图。','ok')}
 function updateSelectedCount(){qsa('.selected-count').forEach(el=>el.textContent=`已选 ${state.selectedItems.size}`)}
 function toggleSelectedItem(id,checked){if(!id)return;if(checked)state.selectedItems.add(id);else state.selectedItems.delete(id);updateSelectedCount();setTableFeedback(state.selectedItems.size?`已选中 ${state.selectedItems.size} 条。`:'未选中记录。',state.selectedItems.size?'ok':'')}
 function selectableItems(){return state.items.filter(i=>i.source_url&&i.id)}
@@ -1983,6 +1980,10 @@ function candidateItems(){return selectableItems()}
 function selectCandidateItems(){const items=selectableItems();items.forEach(i=>state.selectedItems.add(i.id));renderItems();setTableFeedback(items.length?`已选中当前表格 ${items.length} 条。`:'当前表格没有可选择的记录。',items.length?'ok':'error')}
 function clearSelectedItems(){state.selectedItems.clear();renderItems();setTableFeedback('已清空选择。','ok')}
 async function collectSelected(transcribe=false){if(!state.tableId){setTableFeedback('请先选择采集表。','error');return}const ids=[...state.selectedItems];if(!ids.length){setTableFeedback('请先勾选要采集的作品。','error');return}try{setTableFeedback(transcribe?'正在采集选中作品并转写逐字稿...':'正在采集选中作品基础信息...');const r=await api('/api/profile/collect-selected',{method:'POST',body:JSON.stringify({table_id:state.tableId,platform:state.platform,item_ids:ids,transcribe})});setTableFeedback(r.message||`已采集 ${r.processed_count||0} 条选中作品。`,r.paused?'error':'ok');state.selectedItems.clear();await loadTables()}catch(e){setTableFeedback('采集选中失败：'+e.message,'error')}}
+async function addSelectedToDaily(){if(!state.tableId){setTableFeedback('请先选择采集表。','error');return}const ids=[...state.selectedItems];if(!ids.length){setTableFeedback('请先勾选要录入日报的素材。','error');return}try{const r=await api('/api/daily/add',{method:'POST',body:JSON.stringify({table_id:state.tableId,item_ids:ids,date:new Date().toISOString().slice(0,10)})});setTableFeedback(`已录入日报 ${r.count||0} 条。`,'ok');state.selectedItems.clear();await loadItems()}catch(e){setTableFeedback('录入日报失败：'+e.message,'error')}}
+async function removeSelectedFromDaily(){const ids=[...state.selectedItems];if(!ids.length){setTableFeedback('请先勾选要从日报删除的素材。','error');return}try{const r=await api('/api/daily/remove',{method:'POST',body:JSON.stringify({item_ids:ids})});setTableFeedback(`已从日报删除 ${r.count||0} 条。`,'ok');state.selectedItems.clear();await loadItems()}catch(e){setTableFeedback('删除日报失败：'+e.message,'error')}}
+async function addRowToDaily(id){if(!state.tableId){setTableFeedback('请先选择采集表。','error');return}if(!id)return;try{const r=await api('/api/daily/add',{method:'POST',body:JSON.stringify({table_id:state.tableId,item_ids:[id],date:new Date().toISOString().slice(0,10)})});setTableFeedback(`已录入日报 ${r.count||0} 条。`,'ok');await loadItems()}catch(e){setTableFeedback('录入日报失败：'+e.message,'error')}}
+async function removeRowFromDaily(id){if(!id)return;try{const r=await api('/api/daily/remove',{method:'POST',body:JSON.stringify({item_ids:[id]})});setTableFeedback(`已从日报删除 ${r.count||0} 条。`,'ok');await loadItems()}catch(e){setTableFeedback('删除日报失败：'+e.message,'error')}}
 async function scrape(){if(!state.tableId){setStatus('请先回主页创建或选择一个采集表格。','error');return}const urls=qs('#urls').value.split(/\\n+/).map(s=>s.trim()).filter(Boolean);if(!urls.length){setStatus('请先粘贴链接。','error');return}if(state.mode==='profile')return startProfileSession(urls[0]);setStatus('采集中，长视频转写会多等一会儿。');try{const r=await api('/api/scrape',{method:'POST',body:JSON.stringify({table_id:state.tableId,platform:state.platform,mode:state.mode,urls})});setStatus(`完成 ${r.items.length} 条。`,'ok');qs('#urls').value='';await loadTables()}catch(e){setStatus('失败：'+e.message,'error')}}
 async function queueScrape(){if(!state.tableId){setStatus('请先回主页创建或选择一个采集表格。','error');return}const urls=qs('#urls').value.split(/\\n+/).map(s=>s.trim()).filter(Boolean);if(!urls.length){setStatus('请先粘贴链接。','error');return}try{setStatus('正在加入手机任务队列...');const r=await api('/api/queue/add',{method:'POST',body:JSON.stringify({table_id:state.tableId,platform:state.platform,mode:state.mode,urls})});setStatus(`已加入队列 ${r.count||0} 条。Mac 在线时会自动补跑。`,'ok');qs('#urls').value='';await loadTables();await loadEngineStatus()}catch(e){setStatus('加入队列失败：'+e.message,'error')}}
 function toggleYouTubeTools(){const el=qs('#youtubeTools');if(!el)return;el.classList.toggle('open')}
@@ -1991,12 +1992,12 @@ async function enableYouTubePoProvider(){try{setStatus('正在启用 YouTube PO 
 async function startProfileSession(url){if(!['抖音','小红书','B站','视频号','YouTube','Instagram'].includes(state.platform)){setStatus('这个平台暂未接入主页候选预览。','error');return}try{setStatus(`正在打开${state.platform}主页专用浏览器，打开后请手动下滑主页；本阶段只生成候选预览。`);const r=await api('/api/profile/start',{method:'POST',body:JSON.stringify({table_id:state.tableId,platform:state.platform,url})});state.profileSessionId=r.session_id||'';if(qs('#profileStop'))qs('#profileStop').style.display='inline-flex';setStatus(r.message||'主页扫描已启动。发现的作品会先作为候选写入表格，勾选后再采集详情或逐字稿。','ok');pollProfileSession();if(state.profilePollTimer)clearInterval(state.profilePollTimer);state.profilePollTimer=setInterval(pollProfileSession,3000)}catch(e){setStatus('主页扫描启动失败：'+e.message,'error')}}
 async function pollProfileSession(){if(!state.profileSessionId)return;try{const r=await api('/api/profile/status?session_id='+encodeURIComponent(state.profileSessionId));const text=`${r.status||''}：${r.message||''} 候选 ${r.found_count||0} 条，已选 ${state.selectedItems.size} 条`;setStatus(text,(r.status==='失败'||(r.error_count||0)>0)?'error':'ok');await loadTables();if(['已停止','失败'].includes(r.status||'')){if(state.profilePollTimer)clearInterval(state.profilePollTimer);state.profilePollTimer=null;state.profileSessionId='';if(qs('#profileStop'))qs('#profileStop').style.display='none'}}catch(e){setStatus('读取主页扫描状态失败：'+e.message,'error')}}
 async function stopProfileSession(){if(!state.profileSessionId)return;try{const r=await api('/api/profile/stop',{method:'POST',body:JSON.stringify({session_id:state.profileSessionId})});setStatus(r.message||'正在停止主页监听。','ok')}catch(e){setStatus('停止失败：'+e.message,'error')}}
-async function openLogin(){const urls={'抖音':'https://www.douyin.com/','小红书':'https://www.xiaohongshu.com/','B站':'https://www.bilibili.com/','视频号':'https://channels.weixin.qq.com/','YouTube':'https://www.youtube.com/','Instagram':'https://www.instagram.com/'};const url=urls[state.platform]||'https://www.douyin.com/';try{setStatus('正在打开 '+state.platform+' 登录页面...');await api('/api/open-url',{method:'POST',body:JSON.stringify({url})});setStatus('已打开 '+state.platform+' 登录页面，请在弹出的窗口里完成登录。','ok')}catch(e){setStatus('登录页面打开失败：'+e.message,'error')}}
+async function openLogin(){const urls={'抖音':'https://www.douyin.com/','小红书':'https://www.xiaohongshu.com/','B站':'https://www.bilibili.com/','视频号':'https://channels.weixin.qq.com/','YouTube':'https://www.youtube.com/','Instagram':'https://www.instagram.com/'};const url=urls[state.platform]||'https://www.douyin.com/';try{setStatus('正在打开 '+state.platform+' 专用浏览器...');await api('/api/open-url',{method:'POST',body:JSON.stringify({url})});setStatus('已打开 '+state.platform+' 专用浏览器。如果页面已登录，可以直接回到软件重试采集。','ok')}catch(e){setStatus('打开平台浏览器失败：'+e.message,'error')}}
 function exportCsv(){downloadExportFile()}
 function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function escapeAttr(s){return escapeHtml(s).replace(/`/g,'&#96;')}
 function escapeJs(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'')}
-startParticleCanvas();renderPlatforms();loadTables().catch(e=>qs('#status').textContent='加载失败：'+e.message);loadEngineStatus();setInterval(loadEngineStatus,10000);setInterval(()=>{if(state.tableId)loadItems().catch(()=>{})},15000);
+renderPlatforms();loadTables().catch(e=>qs('#status').textContent='加载失败：'+e.message);loadEngineStatus();setInterval(loadEngineStatus,10000);setInterval(()=>{if(state.tableId)loadItems().catch(()=>{})},15000);
 </script>
 </body>
 </html>"""
@@ -2007,52 +2008,62 @@ DESKTOP_DAILY_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MAX日报时间轴</title>
+  <title>外部情报口喷日报</title>
   <style>
-    :root{color-scheme:dark;--bg:#070a0f;--panel:#111923;--panel2:#172231;--line:rgba(255,255,255,.12);--text:#f3f7ff;--muted:#9ba8ba;--orange:#ff9d35;--orange2:#ffc464;--blue:#7cc7ff;--green:#69e69a}
-    *{box-sizing:border-box}body{margin:0;background:#070a0f;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",Inter,sans-serif;min-height:100vh;overflow-x:hidden}body:before{content:"";position:fixed;inset:-22%;z-index:-3;background:radial-gradient(circle at 18% 12%,rgba(255,157,53,.28),transparent 26rem),radial-gradient(circle at 80% 8%,rgba(124,199,255,.14),transparent 24rem),linear-gradient(135deg,#070a0f,#111821 58%,#0a1018);filter:saturate(1.12);animation:dailyDrift 18s ease-in-out infinite alternate}@keyframes dailyDrift{from{transform:translate3d(-2%,0,0) scale(1)}to{transform:translate3d(2%,1.5%,0) scale(1.04)}}.particle-canvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.68}.wrap{position:relative;z-index:1}.wrap{max-width:1680px;margin:0 auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:end;gap:16px;border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:18px}.kicker{color:var(--orange);font-weight:950;letter-spacing:.08em}.top h1{margin:4px 0 0;font-size:38px;letter-spacing:0}.meta{color:var(--muted);font-weight:850}.daily-toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-2px 0 18px}.daily-group{display:flex;gap:7px;align-items:center;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:rgba(13,21,31,.78);padding:7px;backdrop-filter:blur(16px)}.daily-group.tools-flat{border-color:transparent;background:transparent;padding:0}.tool-panel{display:none;margin:-6px 0 18px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:rgba(17,25,35,.9);box-shadow:0 18px 58px rgba(0,0,0,.28);padding:14px;color:#dce7f5}.tool-panel.open{display:block;animation:panelIn .24s cubic-bezier(.2,.8,.2,1)}@keyframes panelIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}.panel-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.panel-head strong{color:#fff}.panel-head span{color:var(--muted);font-size:13px;font-weight:850}.timeline-wrap{position:relative}.timeline-popover{display:none;position:absolute;right:0;top:48px;z-index:10;width:min(430px,90vw);border:1px solid rgba(255,255,255,.14);border-radius:16px;background:rgba(17,25,35,.98);box-shadow:0 24px 80px rgba(0,0,0,.45);padding:14px}.timeline-popover.open{display:block;animation:panelIn .22s cubic-bezier(.2,.8,.2,1)}.date-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.layout{display:grid;grid-template-columns:280px minmax(520px,1fr) minmax(420px,560px);gap:16px;align-items:start;transition:grid-template-columns .34s cubic-bezier(.2,.8,.2,1),gap .34s}.panel{border:1px solid var(--line);border-radius:14px;background:rgba(17,25,35,.88);box-shadow:0 20px 70px rgba(0,0,0,.25);backdrop-filter:blur(18px)}.side{padding:14px;position:sticky;top:14px}.side h2{margin:0 0 12px;font-size:15px;color:#c5d0dd}.list{display:grid;gap:10px}.item{border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:10px;background:#182230;color:var(--text);text-align:left;cursor:pointer}.item.active{border-color:rgba(255,157,53,.75);box-shadow:0 0 0 1px rgba(255,157,53,.18),0 12px 30px rgba(0,0,0,.22)}.idx{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#263244;color:#dbe6f3;font-weight:950;margin-bottom:6px}.item-title{font-weight:950;line-height:1.35}.item-sub{color:var(--muted);font-size:12px;margin-top:8px}.main{padding:18px;min-width:0}.title{font-size:28px;line-height:1.28;font-weight:950;margin:0 0 12px}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.chip{border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:6px 10px;color:#dbe6f3;font-weight:900}.chip.hot{border-color:rgba(255,157,53,.55);color:#ffd6a7}video{width:100%;max-height:68vh;background:#000;border:1px solid rgba(255,255,255,.14);border-radius:12px}.empty-video{min-height:360px;display:grid;place-items:center;background:#030406;border-radius:12px;color:#7f8da0}.detail{padding:18px;max-height:calc(100vh - 130px);overflow:auto}.section{border-top:1px solid rgba(255,255,255,.1);padding-top:14px;margin-top:14px}.section:first-child{border-top:0;margin-top:0;padding-top:0}.section h2{margin:0 0 10px;font-size:16px;color:#dce7f5}.text{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.75;color:#edf4ff;font-size:16px}.link{color:var(--blue);word-break:break-all}.tools{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:12px;background:#263244;color:#edf4ff;min-height:38px;padding:0 12px;font-weight:950;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 8px 24px rgba(0,0,0,.18);transition:transform .28s cubic-bezier(.2,.8,.2,1),box-shadow .28s,background .28s,filter .28s}.btn:hover,.item:hover{transform:translateY(-2px);filter:brightness(1.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.14),0 14px 34px rgba(0,0,0,.28)}.btn:active{transform:translateY(1px) scale(.985);transition-duration:.1s}.btn.primary,.btn.active{background:linear-gradient(135deg,#ffd36b,var(--orange));color:#141a22;box-shadow:0 0 0 1px rgba(255,190,95,.24),0 12px 34px rgba(255,152,47,.18)}.form-grid,.field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.field-grid label{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.09);border-radius:11px;background:linear-gradient(180deg,rgba(32,48,68,.92),rgba(20,31,44,.92));padding:10px;font-size:13px;font-weight:900}.field-grid input{accent-color:var(--orange)}.form-grid input,.form-grid select{width:100%;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:#101923;color:#edf6ff;padding:10px;font:inherit}.daily-table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:12px;background:#07101b;max-height:68vh}.daily-table{border-collapse:collapse;min-width:1480px;width:max-content;font-size:13px}.daily-table th,.daily-table td{border:1px solid rgba(255,255,255,.08);padding:9px;text-align:left;vertical-align:top}.daily-table th{position:sticky;top:0;background:#203048;color:#b9c8dd;z-index:1;white-space:nowrap}.daily-table tr{height:94px}.daily-table tr.active{background:rgba(255,157,53,.1);box-shadow:inset 3px 0 0 var(--orange)}.daily-table tr:hover{background:rgba(255,255,255,.04)}.daily-table .cell{max-height:78px;overflow:auto;white-space:pre-wrap;word-break:break-word}.daily-table.compact tr{height:58px}.daily-table.compact th,.daily-table.compact td{padding:6px}.daily-table.compact .cell{max-height:44px}.daily-table.roomy tr{height:132px}.daily-table.roomy th,.daily-table.roomy td{padding:12px}.daily-table.roomy .cell{max-height:112px}body.mode-video .side,body.mode-video .detail{display:none}body.mode-video .layout{grid-template-columns:minmax(620px,1fr)}body.mode-read .main{display:none}body.mode-read .layout{grid-template-columns:320px minmax(520px,1fr)}body.mode-table .detail{display:none}body.mode-table .layout{grid-template-columns:280px minmax(720px,1fr)}body.density-compact .item{padding:7px}body.density-roomy .layout{grid-template-columns:330px minmax(620px,1.1fr) minmax(500px,.9fr);gap:22px}body.density-roomy .item{padding:14px}@media(max-width:1100px){.layout,body.mode-video .layout,body.mode-read .layout,body.mode-table .layout,body.density-roomy .layout{grid-template-columns:1fr}.side{position:static}.detail{max-height:none}.top{align-items:start;flex-direction:column}.timeline-popover{left:0;right:auto}}
+    :root{color-scheme:dark;--bg:#070a0f;--panel:#111923;--panel2:#172231;--line:rgba(255,255,255,.12);--text:#f3f7ff;--muted:#9ba8ba;--orange:#ff9d35;--blue:#7cc7ff;--mint:#72f0bd;--side:300px;--detail:560px;--row:88px}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% 12%,rgba(255,157,53,.24),transparent 28rem),radial-gradient(circle at 78% 10%,rgba(124,199,255,.16),transparent 24rem),linear-gradient(135deg,#070a0f,#111821 58%,#0a1018);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",Inter,sans-serif;font-weight:850;overflow-x:hidden}
+    #particleCanvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.76}.wrap,.timeline-drawer,.timeline-scrim{position:relative;z-index:1}
+    body:before,body:after{content:"";position:fixed;z-index:0;width:34rem;height:34rem;border-radius:50%;filter:blur(38px);opacity:.2;animation:dailyFloat 12s ease-in-out infinite alternate;pointer-events:none}body:before{left:-12rem;top:8rem;background:#ff9d35}body:after{right:-10rem;bottom:3rem;background:#4fa8ff;animation-delay:-4s}@keyframes dailyFloat{0%{transform:translate3d(0,0,0) scale(.94)}100%{transform:translate3d(4rem,-2rem,0) scale(1.12)}}@keyframes shimmer{0%{background-position:0% 50%}100%{background-position:100% 50%}}
+    .wrap{max-width:1880px;margin:0 auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:end;gap:16px;border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:18px}.kicker{color:var(--orange);font-weight:950;letter-spacing:.12em;text-shadow:0 0 22px rgba(255,157,53,.35)}.top h1{margin:4px 0 0;font-size:38px;letter-spacing:0}.meta{color:var(--muted);font-weight:900}.top-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.count{color:#b8c4d3;font-size:20px;font-weight:950}.btn{border:1px solid rgba(255,255,255,.14);border-radius:10px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.035));color:#edf4ff;min-height:40px;padding:0 14px;font:inherit;font-size:14px;font-weight:950;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 10px 28px rgba(0,0,0,.18);transition:transform .32s cubic-bezier(.18,.89,.32,1.28),border-color .2s,background .2s,box-shadow .2s}.btn:hover,.btn.active{background:#223246;border-color:rgba(255,255,255,.24);transform:translateY(-2px);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 16px 36px rgba(0,0,0,.26)}.btn:active{transform:translateY(1px) scale(.98)}.btn.primary{background:linear-gradient(120deg,#ffd36b,var(--orange),#ffbd6f);background-size:180% 100%;color:#131923;border:0;animation:shimmer 5s ease-in-out infinite alternate}.btn.ghost{background:rgba(255,255,255,.05)}
+    .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 22px}.tool-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--line);border-radius:12px;background:rgba(12,19,28,.72);padding:6px;backdrop-filter:blur(18px)}.tool-panel{display:none;margin:-8px 0 18px;border:1px solid var(--line);border-radius:14px;background:rgba(17,25,35,.88);padding:14px;backdrop-filter:blur(20px);box-shadow:0 18px 60px rgba(0,0,0,.28)}.tool-panel.open{display:block}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}.panel-head strong{font-size:17px}.hint{color:var(--muted);font-size:13px}.checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.checks label,.control-line{border:1px solid rgba(255,255,255,.1);border-radius:11px;background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.028));padding:10px 11px;color:#dce7f5}.checks input{accent-color:var(--orange)}.control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.control-line{display:grid;gap:8px}.control-line input,.control-line select{width:100%;accent-color:var(--orange);border:1px solid rgba(255,255,255,.14);border-radius:8px;background:#0b121c;color:#edf4ff;padding:8px}.control-line input[type=range]{height:22px;padding:0;background:transparent}.control-line input[type=range]::-webkit-slider-runnable-track{height:7px;border-radius:999px;background:linear-gradient(90deg,rgba(255,157,53,.9),rgba(124,199,255,.75));box-shadow:0 0 20px rgba(255,157,53,.22)}.control-line input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;margin-top:-7px;background:#fff3dd;border:3px solid var(--orange);box-shadow:0 8px 24px rgba(255,157,53,.35);transition:transform .26s cubic-bezier(.18,.89,.32,1.28)}.control-line input[type=range]:active::-webkit-slider-thumb{transform:scale(1.22)}
+    .layout{display:grid;grid-template-columns:var(--side) minmax(460px,1fr) minmax(380px,var(--detail));gap:18px;align-items:start;transition:grid-template-columns .45s cubic-bezier(.18,.89,.32,1.08)}.panel{border:1px solid var(--line);border-radius:14px;background:rgba(17,25,35,.84);box-shadow:0 20px 70px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.04);backdrop-filter:blur(16px);min-width:0}.side{padding:14px;position:sticky;top:14px}.side h2{margin:0 0 12px;font-size:15px;color:#c5d0dd}.date-list,.item-list{display:grid;gap:10px}.date-row,.item{border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:12px;background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.025));cursor:pointer;transition:transform .28s cubic-bezier(.18,.89,.32,1.28),border-color .2s,background .2s,box-shadow .2s}.date-row:hover,.item:hover{transform:translateY(-2px);border-color:rgba(255,157,53,.42)}.date-row.active,.item.active{border-color:rgba(255,157,53,.75);box-shadow:0 0 0 1px rgba(255,157,53,.18),0 18px 36px rgba(255,157,53,.09);background:#203044}.idx{display:inline-grid;place-items:center;width:25px;height:25px;border-radius:50%;background:#263244;color:#dbe6f3;font-weight:950;margin-bottom:7px}.item-title{font-weight:950;line-height:1.35}.item-sub{color:var(--muted);font-size:12px;margin-top:8px}
+    .main{padding:20px;min-height:560px}.title{font-size:30px;line-height:1.28;font-weight:950;margin:0 0 12px}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.chip{border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:6px 10px;color:#dbe6f3;font-weight:900}.chip.hot{border-color:rgba(255,157,53,.55);color:#ffd6a7}.cover{display:block;width:100%;max-height:68vh;object-fit:contain;background:#000;border:1px solid rgba(255,255,255,.14);border-radius:10px}.empty-video{min-height:360px;display:grid;place-items:center;background:#030406;border-radius:10px;color:#7f8da0}.reader{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.78;color:#edf4ff;font-size:17px}
+    .detail{padding:20px;max-height:calc(100vh - 150px);overflow:auto}.section{border-top:1px solid rgba(255,255,255,.1);padding-top:14px;margin-top:14px}.section:first-child{border-top:0;margin-top:0;padding-top:0}.section h2{margin:0 0 10px;font-size:24px;color:#f3f7ff}.section h3{margin:0 0 10px;font-size:16px;color:#dce7f5}.card-date{float:right;border:1px solid var(--line);border-radius:999px;padding:5px 11px;color:#cbd5e1;font-size:13px}.editable{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.72;font-size:16px;outline:0;min-height:180px}.editable:focus{box-shadow:0 0 0 2px rgba(255,157,53,.4);border-radius:8px}.link{color:var(--blue);word-break:break-all}.daily-table-wrap{overflow:auto}.daily-table{width:max-content;min-width:100%;border-collapse:collapse}.daily-table th,.daily-table td{border:1px solid rgba(255,255,255,.09);padding:10px;vertical-align:top;text-align:left;max-width:360px}.daily-table th{position:sticky;top:0;background:#1c2a3a;color:#c8d3e1}.daily-table tr{height:var(--row)}.timeline-scrim{position:fixed;inset:0;background:rgba(0,0,0,.42);opacity:0;pointer-events:none;transition:.25s;z-index:4}.timeline-scrim.open{opacity:1;pointer-events:auto}.timeline-drawer{position:fixed;right:18px;top:18px;bottom:18px;width:min(430px,calc(100vw - 36px));z-index:5;border:1px solid rgba(255,255,255,.14);border-radius:18px;background:rgba(13,20,30,.92);backdrop-filter:blur(24px);box-shadow:0 34px 90px rgba(0,0,0,.48);padding:18px;transform:translateX(calc(100% + 32px));transition:transform .48s cubic-bezier(.18,.89,.32,1.08);overflow:auto}.timeline-drawer.open{transform:translateX(0)}.timeline-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.timeline-title{font-size:22px;font-weight:950}.timeline-list{display:grid;gap:10px}.timeline-day{border:1px solid rgba(255,255,255,.1);border-radius:13px;padding:13px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));cursor:pointer;transition:transform .28s cubic-bezier(.18,.89,.32,1.28),border-color .2s}.timeline-day:hover{transform:translateX(-4px);border-color:rgba(255,157,53,.55)}.timeline-day.active{border-color:rgba(255,157,53,.75);box-shadow:0 0 0 1px rgba(255,157,53,.18)}.timeline-day strong{display:block;font-size:18px}.timeline-day span{display:block;color:var(--muted);margin-top:4px}.hidden{display:none!important}.status{color:var(--muted);font-size:13px}.status.ok{color:#9df2bd}.status.error{color:#ffb4ca}@media(max-width:1180px){.layout{grid-template-columns:1fr}.side{position:static}.detail{max-height:none}.top{align-items:start;flex-direction:column}.toolbar{align-items:flex-start;flex-direction:column}}
   </style>
 </head>
 <body>
-  <canvas class="particle-canvas" id="dailyParticleCanvas" aria-hidden="true"></canvas>
-  <main class="wrap">
-    <header class="top">
-      <div><div class="kicker">MAX DAILY INTEL</div><h1>外部情报口喷日报</h1><div class="meta" id="dateText"></div></div>
-      <div class="tools"><div class="meta" id="countText"></div><button class="btn" onclick="location.href='/'">返回采集助手</button><span class="timeline-wrap"><button class="btn" onclick="toggleTimeline()">日报时间轴</button><div class="timeline-popover" id="timelinePopover"><div class="item-sub" style="margin:0 0 10px">选择日报日期</div><div class="date-grid" id="dateGrid"></div></div></span></div>
-    </header>
-    <nav class="daily-toolbar" aria-label="日报视图工具栏">
-      <div class="daily-group"><button class="btn active" data-view="workbench" onclick="setDailyView('workbench')">工作台</button><button class="btn" data-view="video" onclick="setDailyView('video')">视频专注</button><button class="btn" data-view="read" onclick="setDailyView('read')">文稿阅读</button><button class="btn" data-view="table" onclick="setDailyView('table')">表格总览</button></div>
-      <div class="daily-group tools-flat"><button class="btn" data-tool="fields" onclick="toggleTool('fields')">字段配置</button><button class="btn" data-tool="filter" onclick="toggleTool('filter')">筛选</button><button class="btn" data-tool="sort" onclick="toggleTool('sort')">排序</button><button class="btn" data-tool="density" onclick="toggleTool('density')">行高</button><button class="btn" data-tool="space" onclick="toggleTool('space')">调整空间</button></div>
-    </nav>
-    <div class="tool-panel" id="toolPanel"></div>
-    <section class="layout">
-      <aside class="panel side"><h2>当天素材</h2><div class="list" id="list"></div></aside>
-      <section class="panel main" id="main"></section>
-      <aside class="panel detail" id="detail"></aside>
-    </section>
-  </main>
+<canvas id="particleCanvas" aria-hidden="true"></canvas>
+<main class="wrap">
+  <header class="top">
+    <div><div class="kicker">MAX DAILY INTEL</div><h1>外部情报口喷日报</h1><div class="meta" id="dateText">----</div></div>
+    <div class="top-actions"><span class="count" id="count">0/0 条素材</span><button class="btn" onclick="location.href='/'">返回采集助手</button><button class="btn" onclick="showTimeline()">日报时间轴</button></div>
+  </header>
+  <nav class="toolbar" aria-label="日报视图工具栏">
+    <div class="tool-group"><button class="btn active" data-mode="work" onclick="setMode('work')">工作台</button><button class="btn" data-mode="video" onclick="setMode('video')">视频专注</button><button class="btn" data-mode="text" onclick="setMode('text')">文稿阅读</button><button class="btn" data-mode="table" onclick="setMode('table')">表格总览</button></div>
+    <div class="tool-group"><button class="btn ghost" onclick="toggleTool('fields')">字段配置</button><button class="btn ghost" onclick="toggleTool('filter')">筛选</button><button class="btn ghost" onclick="toggleTool('sort')">排序</button><button class="btn ghost" onclick="toggleTool('height')">行高</button><button class="btn ghost" onclick="toggleTool('space')">调整空间</button><button class="btn primary" onclick="saveCurrentCard()">保存卡片</button><span class="status" id="status">正在加载...</span></div>
+  </nav>
+  <section class="tool-panel" id="toolPanel"></section>
+  <section class="layout">
+    <aside class="panel side"><h2>日期</h2><div class="date-list" id="dates"></div><h2 style="margin-top:16px">当天素材</h2><div class="item-list" id="items"></div></aside>
+    <section class="panel main" id="main"></section>
+    <aside class="panel detail" id="detail"></aside>
+  </section>
+</main>
+<div class="timeline-scrim" id="timelineScrim" onclick="closeTimeline()"></div>
+<aside class="timeline-drawer" id="timelineDrawer" aria-label="日报时间轴"></aside>
 <script>
-const qs=s=>document.querySelector(s);let rows=[];let dates=[];let active=0;let activeDate='';let dailyView='workbench';let activeTool='';let density='normal';
-let filters={query:'',platform:'',status:''};let sortState={field:'daily_sort',dir:'asc'};let hiddenFields=new Set();
-const dailyColumns=[['source_url','作品链接'],['platform','平台'],['title','作品标题'],['caption','文案'],['cover_url','封面图链接'],['duration','时长'],['likes','点赞'],['comments','评论'],['shares','分享'],['published_at','发布时间'],['status','抓取状态'],['daily_date','日报日期'],['max_daily_card','MAX口喷卡片'],['max_feedback','Max反馈']];
-function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-function num(v){return v===null||v===undefined||v===''?'':Number(v).toLocaleString('zh-CN')}
-function currentDate(){return new URLSearchParams(location.search).get('date')||''}
-function startDailyParticles(){const canvas=qs('#dailyParticleCanvas');if(!canvas||canvas.dataset.ready)return;canvas.dataset.ready='1';const ctx=canvas.getContext('2d');let w=0,h=0,dpr=1,ps=[];function resize(){dpr=Math.min(window.devicePixelRatio||1,2);w=innerWidth;h=innerHeight;canvas.width=w*dpr;canvas.height=h*dpr;canvas.style.width=w+'px';canvas.style.height=h+'px';ctx.setTransform(dpr,0,0,dpr,0,0);const count=Math.min(92,Math.max(38,Math.floor(w*h/23000)));ps=Array.from({length:count},()=>({x:Math.random()*w,y:Math.random()*h,r:Math.random()*1.9+.55,vx:(Math.random()-.5)*.24,vy:(Math.random()-.5)*.18,a:Math.random()*.42+.15}))}function tick(){ctx.clearRect(0,0,w,h);const g=ctx.createRadialGradient(w*.2,h*.1,0,w*.2,h*.1,Math.max(w,h)*.75);g.addColorStop(0,'rgba(255,157,53,.18)');g.addColorStop(.46,'rgba(124,199,255,.08)');g.addColorStop(1,'rgba(0,0,0,0)');ctx.fillStyle=g;ctx.fillRect(0,0,w,h);ps.forEach((p,i)=>{p.x+=p.vx;p.y+=p.vy;if(p.x<-20)p.x=w+20;if(p.x>w+20)p.x=-20;if(p.y<-20)p.y=h+20;if(p.y>h+20)p.y=-20;ctx.beginPath();ctx.fillStyle=`rgba(255,220,170,${p.a})`;ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();for(let j=i+1;j<ps.length;j++){const q=ps[j],d=Math.hypot(p.x-q.x,p.y-q.y);if(d<120){ctx.strokeStyle=`rgba(124,199,255,${(1-d/120)*.08})`;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.stroke()}}});requestAnimationFrame(tick)}addEventListener('resize',resize);resize();tick()}
-async function load(dateText=currentDate()){const path=dateText?'/api/daily?date='+encodeURIComponent(dateText):'/api/daily';const res=await fetch(path);const data=await res.json();rows=data.items||[];dates=data.dates||[];activeDate=data.date||dateText;active=0;history.replaceState(null,'',activeDate?'/daily?date='+encodeURIComponent(activeDate):'/daily');qs('#dateText').textContent=activeDate;render()}
-function tableUnique(field){return [...new Set(rows.map(i=>String(i[field]??'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-Hans-CN',{numeric:true}))}
-function viewRows(){const q=filters.query.trim().toLowerCase();const list=rows.filter(i=>{if(filters.platform&&i.platform!==filters.platform)return false;if(filters.status&&i.status!==filters.status)return false;if(q&&!['title','source_url','caption','error','platform','status','max_daily_card','max_feedback'].some(k=>String(i[k]??'').toLowerCase().includes(q)))return false;return true});const numeric=new Set(['likes','comments','shares','daily_sort']);const dir=sortState.dir==='asc'?1:-1;return list.sort((a,b)=>{let av=a[sortState.field],bv=b[sortState.field];if(numeric.has(sortState.field))return (Number(av||0)-Number(bv||0))*dir;return String(av??'').localeCompare(String(bv??''),'zh-Hans-CN',{numeric:true})*dir})}
-function renderTimeline(){const html=dates.length?dates.map(d=>`<button class="item ${d.date===activeDate?'active':''}" onclick="load('${esc(d.date)}');toggleTimeline(false)"><div class="item-title">${esc(d.date)}</div><div class="item-sub">${num(d.count)} 条素材</div></button>`).join(''):'<div class="item-sub">还没有日报日期</div>';qs('#dateGrid').innerHTML=html}
-function renderList(){const list=viewRows();qs('#countText').textContent=`${list.length}/${rows.length} 条素材`;const itemHtml=list.map((it,i)=>`<div class="item ${i===active?'active':''}" onclick="active=${i};render()"><span class="idx">${i+1}</span><div class="item-title">${esc(it.title||'未命名素材')}</div><div class="item-sub">${esc(it.platform||'')} · ${esc(it.duration||'')} · 点赞 ${num(it.likes)}</div></div>`).join('');qs('#list').innerHTML=itemHtml||'<div class="item-sub">当前筛选下没有素材</div>'}
-function renderTools(){const panel=qs('#toolPanel');if(!activeTool){panel.classList.remove('open');panel.innerHTML='';return}panel.classList.add('open');if(activeTool==='fields'){panel.innerHTML=`<div class="panel-head"><strong>字段配置</strong><span>和飞书多维表字段对齐，控制“表格总览”列显示。</span><button class="btn" onclick="setFieldPreset('all')">显示全部</button><button class="btn" onclick="setFieldPreset('core')">核心字段</button><button class="btn" onclick="setFieldPreset('daily')">日报字段</button></div><div class="field-grid">${dailyColumns.map(([f,n])=>`<label><input type="checkbox" ${hiddenFields.has(f)?'':'checked'} onchange="setFieldVisible('${f}',this.checked)"> ${n}</label>`).join('')}</div>`;return}if(activeTool==='filter'){const platforms=tableUnique('platform').map(v=>`<option value="${esc(v)}" ${filters.platform===v?'selected':''}>${esc(v)}</option>`).join('');const statuses=tableUnique('status').map(v=>`<option value="${esc(v)}" ${filters.status===v?'selected':''}>${esc(v)}</option>`).join('');panel.innerHTML=`<div class="panel-head"><strong>筛选</strong><span>搜索、平台、抓取状态实时控制左侧素材和表格。</span></div><div class="form-grid"><input placeholder="搜索标题、链接、文案、口喷卡片" value="${esc(filters.query)}" oninput="setFilter('query',this.value)"><select onchange="setFilter('platform',this.value)"><option value="">全部平台</option>${platforms}</select><select onchange="setFilter('status',this.value)"><option value="">全部抓取状态</option>${statuses}</select><button class="btn" onclick="clearFilter()">清空筛选</button></div>`;return}if(activeTool==='sort'){panel.innerHTML=`<div class="panel-head"><strong>排序</strong><span>控制当天素材顺序，表格总览同步变化。</span></div><div class="form-grid"><select onchange="setSort(this.value,sortState.dir)">${dailyColumns.map(([f,n])=>`<option value="${f}" ${sortState.field===f?'selected':''}>${n}</option>`).join('')}<option value="daily_sort" ${sortState.field==='daily_sort'?'selected':''}>加入日报顺序</option></select><select onchange="setSort(sortState.field,this.value)"><option value="asc" ${sortState.dir==='asc'?'selected':''}>升序</option><option value="desc" ${sortState.dir==='desc'?'selected':''}>降序</option></select></div>`;return}if(activeTool==='density'){panel.innerHTML=`<div class="panel-head"><strong>行高</strong><span>调节左侧素材和表格阅读密度。</span></div><div class="tools"><button class="btn ${density==='compact'?'primary':''}" onclick="setDensity('compact')">紧凑</button><button class="btn ${density==='normal'?'primary':''}" onclick="setDensity('normal')">标准</button><button class="btn ${density==='roomy'?'primary':''}" onclick="setDensity('roomy')">宽松</button></div>`;return}panel.innerHTML=`<div class="panel-head"><strong>调整空间</strong><span>在工作台 / 视频专注 / 文稿阅读之间切换布局。</span></div><div class="tools"><button class="btn" onclick="setDailyView('video')">放大视频</button><button class="btn" onclick="setDailyView('read')">放大文稿</button><button class="btn" onclick="setDailyView('table')">表格总览</button><button class="btn" onclick="setDailyView('workbench')">恢复工作台</button></div>`}
-function renderTable(list){const cols=dailyColumns.filter(([f])=>!hiddenFields.has(f));return `<div class="daily-table-wrap"><table class="daily-table ${density==='compact'?'compact':density==='roomy'?'roomy':''}"><thead><tr>${cols.map(([f,n])=>`<th onclick="setSort('${f}',sortState.field==='${f}'&&sortState.dir==='asc'?'desc':'asc')">${esc(n)}${sortState.field===f?(sortState.dir==='asc'?' ↑':' ↓'):''}</th>`).join('')}</tr></thead><tbody>${list.map((it,i)=>`<tr class="${i===active?'active':''}" onclick="active=${i};setDailyView('workbench')">${cols.map(([f])=>`<td><div class="cell">${esc(it[f]??'')}</div></td>`).join('')}</tr>`).join('')||`<tr><td colspan="${cols.length}">当前筛选下没有素材</td></tr>`}</tbody></table></div>`}
-function render(){renderTimeline();const list=viewRows();active=Math.min(active,Math.max(0,list.length-1));renderList();renderTools();if(!list.length){qs('#main').innerHTML='<div class="empty-video">当前筛选下没有加入 Max 日报的素材</div>';qs('#detail').innerHTML='';return}if(dailyView==='table'){qs('#main').innerHTML=renderTable(list);qs('#detail').innerHTML='';return}const it=list[active];const src=it.video_path?`/api/media?item_id=${encodeURIComponent(it.id)}`:'';qs('#main').innerHTML=`<h2 class="title">${esc(it.title||'未命名素材')}</h2><div class="chips"><span class="chip hot">${esc(it.platform||'素材')}</span><span class="chip">点赞 ${num(it.likes)}</span><span class="chip">评论 ${num(it.comments)}</span><span class="chip">分享 ${num(it.shares)}</span><span class="chip">${esc(it.published_at||'')}</span></div>${src?`<video src="${src}" controls playsinline preload="metadata"></video>`:'<div class="empty-video">这条素材还没有下载视频</div>'}`;qs('#detail').innerHTML=`<section class="section"><h2>MAX口喷卡片</h2><div class="text">${esc(it.max_daily_card||'还没有生成口喷卡片')}</div></section><section class="section"><h2>来源链接</h2><a class="link" href="${esc(it.source_url||'#')}" target="_blank">${esc(it.source_url||'')}</a></section><section class="section"><h2>原始文案 / 逐字稿</h2><div class="text">${esc(it.caption||'')}</div></section>`}
-function toggleTimeline(force){const el=qs('#timelinePopover');el.classList.toggle('open',typeof force==='boolean'?force:!el.classList.contains('open'))}
-function setDailyView(view){dailyView=view;document.body.classList.remove('mode-video','mode-read','mode-table');if(view!=='workbench')document.body.classList.add('mode-'+view);document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===view));render()}
-function toggleTool(tool){activeTool=activeTool===tool?'':tool;document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b.dataset.tool===activeTool));renderTools()}
-function setDensity(value){density=value;document.body.classList.remove('density-compact','density-roomy');if(value==='compact')document.body.classList.add('density-compact');if(value==='roomy')document.body.classList.add('density-roomy');render()}
-function setFilter(k,v){filters={...filters,[k]:v};active=0;render()}function clearFilter(){filters={query:'',platform:'',status:''};active=0;render()}function setSort(field,dir){sortState={field,dir:dir==='desc'?'desc':'asc'};active=0;render()}function setFieldVisible(field,visible){if(visible)hiddenFields.delete(field);else hiddenFields.add(field);render()}function setFieldPreset(preset){const core=new Set(['source_url','platform','title','caption','duration','likes','comments','shares','published_at','status','daily_date']);const daily=new Set(['source_url','platform','title','caption','status','daily_date','max_daily_card','max_feedback']);hiddenFields=new Set();if(preset!=='all')dailyColumns.forEach(([f])=>{const keep=preset==='daily'?daily:core;if(!keep.has(f))hiddenFields.add(f)});render()}
-startDailyParticles();load().catch(e=>{qs('#main').innerHTML='<div class="empty-video">日报加载失败：'+esc(e.message)+'</div>'})
+const params=new URLSearchParams(location.search);let tableId=params.get('table_id')||'';let dailyDate=params.get('date')||new Date().toISOString().slice(0,10);let daily={items:[],dates:[]};let current=null;let mode='work';let tool='';let fields=['source_url','platform','title','caption','cover_url','duration','likes','comments','shares','published_at','status','daily_date','max_daily_card','max_feedback'];let visibleFields=new Set(fields);
+const labels={source_url:'作品链接',platform:'平台',title:'作品标题',caption:'文案',cover_url:'封面图链接',duration:'时长',likes:'点赞',comments:'评论',shares:'分享',published_at:'发布时间',status:'抓取状态',daily_date:'日报日期',max_daily_card:'MAX口喷卡片',max_feedback:'Max反馈'};
+function qs(s){return document.querySelector(s)}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function num(v){return (v===null||v===undefined||v==='')?'':Number(v).toLocaleString('zh-CN')}
+async function api(path,opts={}){const res=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});if(!res.ok)throw new Error(await res.text());return res.json()}function setStatus(t,c=''){qs('#status').textContent=t;qs('#status').className='status '+c}
+async function loadDaily(){const q=new URLSearchParams({date:dailyDate});if(tableId)q.set('table_id',tableId);daily=await api('/api/daily?'+q.toString());dailyDate=daily.date;qs('#dateText').textContent=dailyDate;qs('#count').textContent=`${daily.count}/${daily.count} 条素材`;renderDates();selectItem((daily.items||[])[0]||null);renderToolPanel();setStatus('已加载','ok')}
+function renderDates(){const dates=daily.dates&&daily.dates.length?daily.dates:[{date:dailyDate,count:daily.count||0}];qs('#dates').innerHTML=dates.map(d=>`<div class="date-row ${d.date===dailyDate?'active':''}" onclick="dailyDate='${d.date}';loadDaily()"><strong>${esc(d.date)}</strong><br><span class="status">${d.count} 条素材</span></div>`).join('')}
+function renderItems(){qs('#items').innerHTML=(daily.items||[]).map((it,i)=>`<div class="item ${current&&current.id===it.id?'active':''}" onclick="selectItemById('${it.id}')"><span class="idx">${i+1}</span><div class="item-title">${esc(it.title||'未命名素材')}</div><div class="item-sub">${esc(it.platform||'')} · ${esc(it.duration||'')} · 点赞 ${num(it.likes)}</div></div>`).join('')||'<p class="status">当天还没有加入日报的素材。</p>'}
+function selectItemById(id){selectItem((daily.items||[]).find(x=>x.id===id)||null)}function selectItem(it){current=it;renderItems();renderMain();renderDetail()}
+function setMode(next){mode=next;document.querySelectorAll('[data-mode]').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));renderMain();renderDetail()}
+function renderMain(){if(!current){qs('#main').innerHTML='<div class="empty-video">今天还没有加入 Max 日报的素材</div>';return}if(mode==='table'){renderTable();return}const cover=current.cover_url?`<img class="cover" src="/api/cover?url=${encodeURIComponent(current.cover_url)}" alt="素材封面">`:'';const text=`<div class="reader">${esc(current.caption||current.error||'暂无文稿')}</div>`;const media=mode==='text'?text:(cover||`<div class="empty-video">这条素材还没有封面或视频预览</div>`);qs('#main').innerHTML=`<h2 class="title">${esc(current.title||'未命名素材')}</h2><div class="chips"><span class="chip hot">${esc(current.platform||'素材')}</span><span class="chip">点赞 ${num(current.likes)}</span><span class="chip">评论 ${num(current.comments)}</span><span class="chip">分享 ${num(current.shares)}</span><span class="chip">${esc(current.published_at||'')}</span></div>${media}`}
+function renderDetail(){if(mode==='table'){qs('#detail').innerHTML=`<section class="section"><h2>表格总览</h2><div class="status">字段显示可在“字段配置”里调整。</div></section>`;return}if(!current){qs('#detail').innerHTML='';return}qs('#detail').innerHTML=`<section class="section"><h2>MAX口喷卡片 <span class="card-date">${esc(dailyDate)}</span></h2><div class="status">外部情报口喷卡片</div><div class="editable" id="cardBody" contenteditable="true" spellcheck="false">${esc(current.max_daily_card||'还没有生成口喷卡片')}</div></section><section class="section"><h3>来源链接</h3><a class="link" href="${esc(current.source_url||'#')}" target="_blank">${esc(current.source_url||'')}</a></section><section class="section"><h3>原始文案 / 逐字稿</h3><div class="reader">${esc(current.caption||'')}</div></section>`}
+function renderTable(){const rows=daily.items||[];const cols=fields.filter(f=>visibleFields.has(f));qs('#main').innerHTML=`<div class="daily-table-wrap"><table class="daily-table"><thead><tr>${cols.map(f=>`<th>${labels[f]}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(f=>`<td>${esc(r[f]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
+function toggleTool(next){tool=tool===next?'':next;renderToolPanel()}function renderToolPanel(){const p=qs('#toolPanel');if(!tool){p.className='tool-panel';p.innerHTML='';return}p.className='tool-panel open';if(tool==='fields')p.innerHTML=`<div class="panel-head"><div><strong>字段配置</strong><div class="hint">和飞书多维表字段对齐，控制“表格总览”列显示。</div></div><div><button class="btn" onclick="fields.forEach(f=>visibleFields.add(f));renderToolPanel();renderMain()">显示全部</button><button class="btn" onclick="visibleFields=new Set(['source_url','platform','title','caption','status','daily_date','max_daily_card']);renderToolPanel();renderMain()">日报字段</button></div></div><div class="checks">${fields.map(f=>`<label><input type="checkbox" ${visibleFields.has(f)?'checked':''} onchange="this.checked?visibleFields.add('${f}'):visibleFields.delete('${f}');renderMain()"> ${labels[f]}</label>`).join('')}</div>`;else if(tool==='filter')p.innerHTML=`<div class="panel-head"><div><strong>筛选</strong><div class="hint">按标题、文案、平台或状态过滤当天素材。</div></div></div><div class="control-grid"><label class="control-line">关键词<input id="filterInput" oninput="filterRows(this.value)" placeholder="搜索日报素材"></label></div>`;else if(tool==='sort')p.innerHTML=`<div class="panel-head"><div><strong>排序</strong><div class="hint">调整当天素材阅读顺序。</div></div></div><div class="control-grid"><label class="control-line">排序字段<select onchange="sortRows(this.value)"><option value="daily_sort">日报顺序</option><option value="likes">点赞</option><option value="comments">评论</option><option value="shares">分享</option><option value="published_at">发布时间</option></select></label></div>`;else if(tool==='height')p.innerHTML=`<div class="panel-head"><div><strong>行高</strong><div class="hint">控制“表格总览”的单行高度。</div></div></div><div class="control-grid"><label class="control-line">行高滑块<input id="rowRange" type="range" min="56" max="180" value="88" data-css-var="--row" data-unit="px"></label></div>`;else p.innerHTML=`<div class="panel-head"><div><strong>调整空间</strong><div class="hint">拖动滑块调整左侧素材栏和右侧口喷卡片宽度。</div></div></div><div class="control-grid"><label class="control-line">左侧宽度<input id="spaceRange" type="range" min="240" max="420" value="300" data-css-var="--side" data-unit="px"></label><label class="control-line">卡片宽度<input id="detailRange" type="range" min="420" max="760" value="560" data-css-var="--detail" data-unit="px"></label></div>`;bindSpringSlider()}
+function filterRows(q){q=String(q||'').toLowerCase();daily.items=(daily.items||[]).filter(it=>!q||['title','caption','platform','status','max_daily_card'].some(k=>String(it[k]||'').toLowerCase().includes(q)));renderItems();renderMain()}
+function sortRows(field){daily.items=[...(daily.items||[])].sort((a,b)=>String(b[field]??'').localeCompare(String(a[field]??''),'zh-Hans-CN',{numeric:true}));renderItems();renderMain()}
+async function saveCurrentCard(){if(!current||!qs('#cardBody'))return;try{current=await api('/api/daily/update',{method:'POST',body:JSON.stringify({item_id:current.id,updates:{max_daily_card:qs('#cardBody').innerText}})});const idx=(daily.items||[]).findIndex(x=>x.id===current.id);if(idx>=0)daily.items[idx]=current;setStatus('已保存','ok')}catch(e){setStatus('保存失败：'+e.message,'error')}}
+function bindSpringSlider(){document.querySelectorAll('input[type="range"][data-css-var]').forEach(input=>{if(input.dataset.bound)return;input.dataset.bound='1';let currentValue=Number(input.value),target=currentValue,velocity=0;const key=input.dataset.cssVar,unit=input.dataset.unit||'';function tick(){const stiffness=.16,damping=.68;velocity+=(target-currentValue)*stiffness;velocity*=damping;currentValue+=velocity;document.documentElement.style.setProperty(key,currentValue.toFixed(2)+unit);if(Math.abs(target-currentValue)>.05||Math.abs(velocity)>.05)requestAnimationFrame(tick);else{currentValue=target;document.documentElement.style.setProperty(key,target+unit)}}input.addEventListener('input',()=>{target=Number(input.value);requestAnimationFrame(tick)})})}
+function renderTimeline(){const dates=daily.dates&&daily.dates.length?daily.dates:[{date:dailyDate,count:daily.count||0}];qs('#timelineDrawer').innerHTML=`<div class="timeline-head"><div><div class="kicker">DAILY TIMELINE</div><div class="timeline-title">日报时间轴</div></div><button class="btn" onclick="closeTimeline()">关闭</button></div><div class="timeline-list">${dates.map(d=>`<div class="timeline-day ${d.date===dailyDate?'active':''}" onclick="dailyDate='${d.date}';closeTimeline();loadDaily()"><strong>${esc(d.date)}</strong><span>${d.count} 条素材</span></div>`).join('')}</div>`}
+function showTimeline(){renderTimeline();qs('#timelineDrawer').classList.add('open');qs('#timelineScrim').classList.add('open')}
+function closeTimeline(){qs('#timelineDrawer').classList.remove('open');qs('#timelineScrim').classList.remove('open')}
+function startParticles(){const canvas=qs('#particleCanvas');if(!canvas)return;const ctx=canvas.getContext('2d');let w=0,h=0,parts=[];function resize(){w=canvas.width=innerWidth*devicePixelRatio;h=canvas.height=innerHeight*devicePixelRatio;canvas.style.width=innerWidth+'px';canvas.style.height=innerHeight+'px';const count=Math.min(120,Math.max(46,Math.floor(innerWidth/14)));parts=Array.from({length:count},()=>({x:Math.random()*w,y:Math.random()*h,vx:(Math.random()-.5)*.18*devicePixelRatio,vy:(Math.random()-.5)*.18*devicePixelRatio,r:(Math.random()*1.6+0.5)*devicePixelRatio,a:Math.random()*.55+.18}))}function draw(){ctx.clearRect(0,0,w,h);for(const p of parts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>w)p.vx*=-1;if(p.y<0||p.y>h)p.vy*=-1;ctx.beginPath();ctx.fillStyle=`rgba(255,190,112,${p.a})`;ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill()}for(let i=0;i<parts.length;i++){for(let j=i+1;j<parts.length;j++){const a=parts[i],b=parts[j],dx=a.x-b.x,dy=a.y-b.y,d=Math.hypot(dx,dy),max=130*devicePixelRatio;if(d<max){ctx.strokeStyle=`rgba(124,199,255,${(1-d/max)*.12})`;ctx.lineWidth=devicePixelRatio*.7;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}}}requestAnimationFrame(draw)}resize();addEventListener('resize',resize);draw()}
+startParticles();loadDaily().catch(e=>setStatus('加载失败：'+e.message,'error'));
 </script>
 </body>
 </html>"""
@@ -2109,6 +2120,11 @@ def desktop_export_rows(db_path: Path, table_id: str) -> List[Dict[str, Any]]:
     return desktop_list_items(db_path, table_id)
 
 
+def desktop_default_table_id(db_path: Path) -> str:
+    tables = desktop_list_tables(db_path)
+    return str((tables[0] or {}).get("id") or "") if tables else ""
+
+
 def desktop_export_csv(db_path: Path, table_id: str) -> bytes:
     from io import StringIO
 
@@ -2150,12 +2166,230 @@ def desktop_export_markdown(db_path: Path, table_id: str) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
+def desktop_table_name(db_path: Path, table_id: str) -> str:
+    for table in desktop_list_tables(db_path):
+        if table.get("id") == table_id:
+            return str(table.get("name") or "CHEN内容采集表")
+    return "CHEN内容采集表"
+
+
+def desktop_metric_text(item: Dict[str, Any]) -> str:
+    parts = []
+    for key, label in (("likes", "赞"), ("comments", "评"), ("shares", "转")):
+        value = item.get(key)
+        if value is not None and value != "":
+            parts.append(f"{label} {value}")
+    return " / ".join(parts) if parts else "暂无互动数据"
+
+
+def desktop_caption_excerpt(text: Any, limit: int = 700) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + "..."
+
+
+def desktop_build_oral_daily_body(db_path: Path, table_id: str) -> str:
+    rows = desktop_export_rows(db_path, table_id)
+    ready = [item for item in rows if str(item.get("status") or "") in {"成功", "图文作品", "需ASR"}]
+    blocked = [item for item in rows if item not in ready]
+    ready.sort(
+        key=lambda item: (
+            int(item.get("likes") or 0) + int(item.get("comments") or 0) * 3 + int(item.get("shares") or 0) * 5,
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+    lines = [
+        f"生成时间：{now_text()}",
+        f"素材表：{desktop_table_name(db_path, table_id)}",
+        "",
+        "一、今天先让 Max 看的外部情报",
+        "",
+    ]
+    if not ready:
+        lines.append("今天还没有可直接口喷的外部情报。")
+    for index, item in enumerate(ready, 1):
+        lines.extend(
+            [
+                f"{index}. {item.get('title') or '未命名情报'}",
+                f"平台：{item.get('platform') or ''}",
+                f"链接：{item.get('source_url') or ''}",
+                f"互动：{desktop_metric_text(item)}",
+                f"发布时间：{item.get('published_at') or ''}",
+                "原始材料：",
+                desktop_caption_excerpt(item.get("caption") or item.get("error") or "", 1200) or "暂无文案/逐字稿。",
+                "",
+                "Max 可直接改这里：",
+                "- 这个情报最值得讲的点：",
+                "- 可以口喷的判断：",
+                "- 需要追问或补证的地方：",
+                "",
+            ]
+        )
+    lines.extend(["二、还不能直接给 Max 讲的素材", ""])
+    if not blocked:
+        lines.append("没有需要补救的素材。")
+    for index, item in enumerate(blocked, 1):
+        lines.extend(
+            [
+                f"{index}. {item.get('title') or item.get('source_url') or '未命名素材'}",
+                f"状态：{item.get('status') or ''}",
+                f"原因：{item.get('error') or '暂无备注'}",
+                f"链接：{item.get('source_url') or ''}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def desktop_save_daily_report(db_path: Path, table_id: str, title: str, body: str) -> Dict[str, Any]:
+    desktop_db_init(db_path)
+    table_id = table_id or desktop_default_table_id(db_path)
+    if not table_id:
+        raise ValueError("缺少 table_id")
+    safe_title = str(title or "").strip() or "外部情报口喷日报"
+    safe_body = str(body or "")
+    ts = now_text()
+    report_id = str(uuid.uuid4())
+    with desktop_connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_reports(id, table_id, title, body, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(table_id) DO UPDATE SET
+                title = excluded.title,
+                body = excluded.body,
+                updated_at = excluded.updated_at
+            """,
+            (report_id, table_id, safe_title, safe_body, ts, ts),
+        )
+        row = conn.execute("SELECT * FROM daily_reports WHERE table_id = ?", (table_id,)).fetchone()
+    report = desktop_row_to_dict(row)
+    report["table_name"] = desktop_table_name(db_path, table_id)
+    report["url"] = f"/daily?table_id={urllib.parse.quote(table_id)}"
+    return report
+
+
+def desktop_get_daily_report(db_path: Path, table_id: str = "") -> Dict[str, Any]:
+    desktop_db_init(db_path)
+    table_id = table_id or desktop_default_table_id(db_path)
+    if not table_id:
+        raise ValueError("没有可生成日报的采集表。")
+    with desktop_connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM daily_reports WHERE table_id = ?", (table_id,)).fetchone()
+    if row:
+        report = desktop_row_to_dict(row)
+        report["table_name"] = desktop_table_name(db_path, table_id)
+        report["url"] = f"/daily?table_id={urllib.parse.quote(table_id)}"
+        return report
+    return desktop_save_daily_report(
+        db_path,
+        table_id,
+        "外部情报口喷日报",
+        desktop_build_oral_daily_body(db_path, table_id),
+    )
+
+
+def desktop_regenerate_daily_report(db_path: Path, table_id: str) -> Dict[str, Any]:
+    return desktop_save_daily_report(
+        db_path,
+        table_id,
+        "外部情报口喷日报",
+        desktop_build_oral_daily_body(db_path, table_id),
+    )
+
+
+def desktop_export_max_daily(db_path: Path, table_id: str) -> bytes:
+    table_name = desktop_table_name(db_path, table_id)
+    rows = desktop_export_rows(db_path, table_id)
+    ready = [item for item in rows if str(item.get("status") or "") in {"成功", "图文作品", "需ASR"}]
+    blocked = [item for item in rows if item not in ready]
+    ready.sort(
+        key=lambda item: (
+            int(item.get("likes") or 0) + int(item.get("comments") or 0) * 3 + int(item.get("shares") or 0) * 5,
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+    status_counts: Dict[str, int] = {}
+    for item in rows:
+        status = str(item.get("status") or "未标记")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    lines = [
+        "# MAX 日报",
+        "",
+        f"- 生成时间：{now_text()}",
+        f"- 采集表：{table_name}",
+        f"- 素材总数：{len(rows)}",
+        f"- 可直接阅读：{len(ready)}",
+        f"- 需要补救：{len(blocked)}",
+        "",
+        "## 今日状态",
+        "",
+    ]
+    if status_counts:
+        for status, count in sorted(status_counts.items(), key=lambda pair: (-pair[1], pair[0])):
+            lines.append(f"- {status}：{count}")
+    else:
+        lines.append("- 当前没有素材。")
+
+    lines.extend(["", "## 给 Max 的阅读顺序", ""])
+    if not ready:
+        lines.append("今天还没有可直接交给 Max 阅读的素材。")
+    for index, item in enumerate(ready, 1):
+        caption = desktop_caption_excerpt(item.get("caption") or item.get("error") or "")
+        lines.extend(
+            [
+                f"### {index}. {item.get('title') or '未命名作品'}",
+                "",
+                f"- 平台：{item.get('platform') or ''}",
+                f"- 作品链接：{item.get('source_url') or ''}",
+                f"- 互动：{desktop_metric_text(item)}",
+                f"- 发布时间：{item.get('published_at') or ''}",
+                f"- 状态：{item.get('status') or ''}",
+                "",
+                "#### 给 Max 先看的原始材料",
+                "",
+                caption or "暂无文案/逐字稿。",
+                "",
+            ]
+        )
+
+    lines.extend(["## 需要补救的素材", ""])
+    if not blocked:
+        lines.append("没有需要补救的素材。")
+    for index, item in enumerate(blocked, 1):
+        lines.extend(
+            [
+                f"{index}. {item.get('title') or item.get('source_url') or '未命名作品'}",
+                f"   - 平台：{item.get('platform') or ''}",
+                f"   - 状态：{item.get('status') or ''}",
+                f"   - 原因：{item.get('error') or '暂无备注'}",
+                f"   - 链接：{item.get('source_url') or ''}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 使用方式",
+            "",
+            "把这份 Markdown 直接发给 Max。先看“给 Max 的阅读顺序”，遇到需要补救的素材再回采集助手处理登录、转写或下载问题。",
+        ]
+    )
+    return "\n".join(lines).encode("utf-8")
+
+
 def desktop_export_json(db_path: Path, table_id: str) -> bytes:
     return json.dumps(desktop_export_rows(db_path, table_id), ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def desktop_export_bytes(db_path: Path, table_id: str, fmt: str) -> Tuple[bytes, str, str]:
     fmt = (fmt or "csv").lower()
+    if fmt in {"max-daily", "max_daily", "max", "daily"}:
+        return desktop_export_max_daily(db_path, table_id), "text/markdown; charset=utf-8", ".md"
     if fmt == "markdown":
         return desktop_export_markdown(db_path, table_id), "text/markdown; charset=utf-8", ".md"
     if fmt == "json":
@@ -2163,14 +2397,13 @@ def desktop_export_bytes(db_path: Path, table_id: str, fmt: str) -> Tuple[bytes,
     return desktop_export_csv(db_path, table_id), "text/csv; charset=utf-8", ".csv"
 
 
-def desktop_export_default_name(db_path: Path, table_id: str, ext: str) -> str:
-    table_name = "CHEN内容采集表"
-    for table in desktop_list_tables(db_path):
-        if table.get("id") == table_id:
-            table_name = str(table.get("name") or table_name)
-            break
+def desktop_export_default_name(db_path: Path, table_id: str, ext: str, fmt: str = "") -> str:
+    table_name = desktop_table_name(db_path, table_id)
     safe = re.sub(r'[\\/:*?"<>|\n\r]+', "_", table_name).strip(" .") or "CHEN内容采集表"
-    return f"{safe}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}{ext}"
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if (fmt or "").lower() in {"max-daily", "max_daily", "max", "daily"}:
+        return f"MAX日报-{safe}-{stamp}{ext}"
+    return f"{safe}-{stamp}{ext}"
 
 
 def desktop_choose_save_path(default_name: str) -> Path:
@@ -2201,212 +2434,12 @@ def desktop_save_export_file(
     if not table_id:
         raise ValueError("缺少 table_id")
     data, content_type, ext = desktop_export_bytes(db_path, table_id, fmt)
-    target = output_path or desktop_choose_save_path(desktop_export_default_name(db_path, table_id, ext))
+    target = output_path or desktop_choose_save_path(desktop_export_default_name(db_path, table_id, ext, fmt))
     if target.suffix.lower() != ext:
         target = target.with_suffix(ext)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     return {"path": str(target), "format": ext.lstrip("."), "content_type": content_type, "bytes": len(data)}
-
-
-def desktop_setting_get(db_path: Path, key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    desktop_db_init(db_path)
-    with desktop_connect(db_path) as conn:
-        row = conn.execute("SELECT value_json FROM desktop_settings WHERE key = ?", (key,)).fetchone()
-    if not row:
-        return dict(default or {})
-    try:
-        return json.loads(row["value_json"] or "{}")
-    except json.JSONDecodeError:
-        return dict(default or {})
-
-
-def desktop_setting_set(db_path: Path, key: str, value: Dict[str, Any]) -> Dict[str, Any]:
-    desktop_db_init(db_path)
-    state = dict(value or {})
-    state["updated_at"] = now_text()
-    with desktop_connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO desktop_settings(key, value_json, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
-            """,
-            (key, json.dumps(state, ensure_ascii=False), state["updated_at"]),
-        )
-    return state
-
-
-def desktop_public_tunnel_default_state() -> Dict[str, Any]:
-    return {"status": "stopped", "url": f"https://{DESKTOP_LOCALTUNNEL_SUBDOMAIN}.loca.lt", "error": "", "pid": 0}
-
-
-def desktop_public_tunnel_state(db_path: Path = DESKTOP_DB_PATH) -> Dict[str, Any]:
-    state = {**desktop_public_tunnel_default_state(), **desktop_setting_get(db_path, "public_tunnel")}
-    pid = int(state.get("pid") or 0)
-    if state.get("status") in {"starting", "online"} and pid and not desktop_pid_running(pid):
-        state.update({"status": "stopped", "error": "公网 tunnel 已停止，正在等待自动重启。", "pid": 0})
-        state = desktop_setting_set(db_path, "public_tunnel", state)
-    state["url"] = state.get("url") or f"https://{DESKTOP_LOCALTUNNEL_SUBDOMAIN}.loca.lt"
-    state["daily_url"] = state["url"].rstrip("/") + "/daily"
-    return state
-
-
-def desktop_pid_running(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except OSError:
-        return False
-
-
-def desktop_public_tunnel_env() -> Dict[str, str]:
-    env = dict(os.environ)
-    extra = [
-        str(Path.home() / ".local" / "bin"),
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ]
-    current = env.get("PATH") or ""
-    env["PATH"] = ":".join(extra + ([current] if current else []))
-    return env
-
-
-def desktop_localtunnel_path() -> str:
-    for candidate in [
-        Path.home() / ".local" / "bin" / "npx",
-        Path("/opt/homebrew/bin/npx"),
-        Path("/usr/local/bin/npx"),
-    ]:
-        if candidate.exists():
-            return str(candidate)
-    return shutil.which("npx") or ""
-
-
-def desktop_parse_public_tunnel_url(text: str) -> str:
-    match = re.search(r"https://[a-z0-9-]+\.loca\.lt", text or "", re.I)
-    return match.group(0).rstrip("/") if match else ""
-
-
-def desktop_save_public_tunnel_state(db_path: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
-    state = {**desktop_public_tunnel_state(db_path), **(updates or {})}
-    if state.get("url"):
-        state["url"] = str(state["url"]).rstrip("/")
-    return desktop_setting_set(db_path, "public_tunnel", state)
-
-
-def desktop_watch_public_tunnel_output(db_path: Path, proc: subprocess.Popen) -> None:
-    state = desktop_public_tunnel_state(db_path)
-    try:
-        if proc.stdout is None:
-            return
-        for line in proc.stdout:
-            url = desktop_parse_public_tunnel_url(str(line or ""))
-            if url:
-                state.update({"status": "online", "url": url, "error": "", "pid": proc.pid})
-                desktop_save_public_tunnel_state(db_path, state)
-            if proc.poll() is not None:
-                break
-    finally:
-        code = proc.poll()
-        if code is not None and code != 0:
-            desktop_save_public_tunnel_state(db_path, {"status": "error", "error": f"localtunnel 已退出，代码 {code}", "pid": 0})
-
-
-def desktop_start_public_tunnel(db_path: Path = DESKTOP_DB_PATH) -> Dict[str, Any]:
-    state = desktop_public_tunnel_state(db_path)
-    pid = int(state.get("pid") or 0)
-    if state.get("status") in {"starting", "online"} and desktop_pid_running(pid):
-        return state
-    binary = desktop_localtunnel_path()
-    if not binary:
-        return desktop_save_public_tunnel_state(db_path, {"status": "missing", "error": "未找到 npx/localtunnel，无法启动公网入口。", "pid": 0})
-    proc = subprocess.Popen(
-        [binary, "--yes", "localtunnel", "--port", "51216", "--subdomain", DESKTOP_LOCALTUNNEL_SUBDOMAIN],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=desktop_public_tunnel_env(),
-    )
-    DESKTOP_PUBLIC_TUNNEL_PROCESSES[str(db_path)] = proc
-    state = desktop_save_public_tunnel_state(db_path, {
-        "status": "starting",
-        "url": f"https://{DESKTOP_LOCALTUNNEL_SUBDOMAIN}.loca.lt",
-        "error": "",
-        "pid": proc.pid,
-    })
-    threading.Thread(target=desktop_watch_public_tunnel_output, args=(db_path, proc), daemon=True).start()
-    return state
-
-
-def desktop_public_daily_healthy(url: str) -> bool:
-    if not url:
-        return False
-    try:
-        req = urllib.request.Request(url.rstrip("/") + "/daily", headers={"User-Agent": "ChenDailyMonitor/1.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            return 200 <= int(resp.status) < 300
-    except Exception:
-        return False
-
-
-def desktop_restart_public_tunnel(db_path: Path) -> Dict[str, Any]:
-    state = desktop_public_tunnel_state(db_path)
-    pid = int(state.get("pid") or 0)
-    if pid and desktop_pid_running(pid):
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        time.sleep(1)
-    return desktop_start_public_tunnel(db_path)
-
-
-def desktop_public_tunnel_monitor(db_path: Path) -> None:
-    while True:
-        try:
-            state = desktop_public_tunnel_state(db_path)
-            if not desktop_public_daily_healthy(str(state.get("url") or "")):
-                desktop_save_public_tunnel_state(db_path, {"status": "restarting", "error": "公网入口健康检查失败，正在自动重启。"})
-                desktop_restart_public_tunnel(db_path)
-        except Exception as e:
-            desktop_save_public_tunnel_state(db_path, {"status": "error", "error": f"公网守护失败：{e}", "pid": 0})
-        time.sleep(60)
-
-
-def desktop_ensure_public_tunnel_monitor(db_path: Path) -> None:
-    key = str(db_path)
-    with DESKTOP_PUBLIC_TUNNEL_MONITOR_LOCK:
-        if key in DESKTOP_PUBLIC_TUNNEL_MONITORS:
-            return
-        DESKTOP_PUBLIC_TUNNEL_MONITORS.add(key)
-    threading.Thread(target=desktop_public_tunnel_monitor, args=(db_path,), daemon=True).start()
-
-
-def desktop_is_public_host(host: str) -> bool:
-    clean = str(host or "").split(",", 1)[0].strip().lower().split(":", 1)[0]
-    return clean.endswith((".loca.lt", ".trycloudflare.com", ".localhost.run", ".lhr.rocks"))
-
-
-def desktop_public_gateway_action(headers: Any, path: str, method: str) -> str:
-    hosts = [headers.get("Host") or "", headers.get("X-Forwarded-Host") or "", headers.get("X-Original-Host") or ""]
-    is_public = any(desktop_is_public_host(host) for host in hosts)
-    if not is_public:
-        return "allow"
-    method = str(method or "GET").upper()
-    path = urllib.parse.urlparse(path or "/").path or "/"
-    if method == "GET" and path in ("", "/"):
-        return "redirect_daily"
-    if method == "GET" and path in DESKTOP_PUBLIC_ALLOWED_GET_PATHS:
-        return "allow"
-    return "block"
 
 
 def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
@@ -2417,15 +2450,6 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             try:
-                public_action = desktop_public_gateway_action(self.headers, parsed.path, "GET")
-                if public_action == "redirect_daily":
-                    self.send_response(302)
-                    self.send_header("Location", "/daily")
-                    self.end_headers()
-                    return
-                if public_action == "block":
-                    desktop_text_response(self, "Not found", status=404)
-                    return
                 if parsed.path in ("", "/"):
                     desktop_text_response(self, DESKTOP_APP_HTML)
                     return
@@ -2442,17 +2466,6 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
                 if parsed.path == "/api/engine/status":
                     desktop_json_response(self, desktop_engine_status(db_path, cfg))
                     return
-                if parsed.path == "/api/public-tunnel/status":
-                    desktop_json_response(self, desktop_public_tunnel_state(db_path))
-                    return
-                if parsed.path == "/api/daily":
-                    params = urllib.parse.parse_qs(parsed.query)
-                    desktop_json_response(self, desktop_daily_payload(db_path, (params.get("date") or [""])[0]))
-                    return
-                if parsed.path == "/api/media":
-                    params = urllib.parse.parse_qs(parsed.query)
-                    desktop_media_response(self, desktop_media_path(db_path, (params.get("item_id") or [""])[0]))
-                    return
                 if parsed.path == "/api/tables":
                     desktop_json_response(self, desktop_list_tables(db_path))
                     return
@@ -2460,6 +2473,17 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
                     params = urllib.parse.parse_qs(parsed.query)
                     table_id = (params.get("table_id") or [""])[0]
                     desktop_json_response(self, desktop_list_items(db_path, table_id))
+                    return
+                if parsed.path == "/api/daily-report":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    table_id = (params.get("table_id") or [""])[0]
+                    desktop_json_response(self, desktop_get_daily_report(db_path, table_id))
+                    return
+                if parsed.path == "/api/daily":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    table_id = (params.get("table_id") or [""])[0]
+                    daily_date = (params.get("date") or [""])[0]
+                    desktop_json_response(self, desktop_daily_summary(db_path, table_id, daily_date))
                     return
                 if parsed.path == "/api/profile/status":
                     params = urllib.parse.parse_qs(parsed.query)
@@ -2471,7 +2495,7 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
                     table_id = (params.get("table_id") or [""])[0]
                     fmt = (params.get("format") or ["csv"])[0]
                     data, content_type, ext = desktop_export_bytes(db_path, table_id, fmt)
-                    filename = desktop_export_default_name(db_path, table_id, ext)
+                    filename = desktop_export_default_name(db_path, table_id, ext, fmt)
                     self.send_response(200)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Content-Disposition", f'attachment; filename="{urllib.parse.quote(filename)}"')
@@ -2505,14 +2529,7 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             try:
-                public_action = desktop_public_gateway_action(self.headers, parsed.path, "POST")
-                if public_action == "block":
-                    desktop_json_response(self, {"error": "Not found"}, status=404)
-                    return
                 payload = desktop_read_json(self)
-                if parsed.path == "/api/public-tunnel/start":
-                    desktop_json_response(self, desktop_start_public_tunnel(db_path))
-                    return
                 if parsed.path == "/api/tables":
                     table = desktop_create_table(
                         db_path,
@@ -2545,10 +2562,6 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
                     result = desktop_open_url(str(payload.get("url") or ""))
                     desktop_json_response(self, result)
                     return
-                if parsed.path == "/api/browser/login":
-                    result = desktop_open_login_browser(str(payload.get("platform") or "抖音"), cfg)
-                    desktop_json_response(self, result)
-                    return
                 if parsed.path == "/api/cover/save":
                     result = desktop_save_cover_file(
                         str(payload.get("url") or ""),
@@ -2570,6 +2583,46 @@ def make_desktop_app_handler(cfg: Dict[str, Any], db_path: Path):
                         db_path,
                         str(payload.get("table_id") or ""),
                         str(payload.get("format") or "csv"),
+                    )
+                    desktop_json_response(self, result)
+                    return
+                if parsed.path == "/api/daily-report/save":
+                    result = desktop_save_daily_report(
+                        db_path,
+                        str(payload.get("table_id") or ""),
+                        str(payload.get("title") or ""),
+                        str(payload.get("body") or ""),
+                    )
+                    desktop_json_response(self, result)
+                    return
+                if parsed.path == "/api/daily-report/regenerate":
+                    result = desktop_regenerate_daily_report(
+                        db_path,
+                        str(payload.get("table_id") or ""),
+                    )
+                    desktop_json_response(self, result)
+                    return
+                if parsed.path == "/api/daily/add":
+                    result = desktop_daily_add_items(
+                        db_path,
+                        str(payload.get("table_id") or ""),
+                        [str(item_id) for item_id in (payload.get("item_ids") or [])],
+                        str(payload.get("date") or ""),
+                    )
+                    desktop_json_response(self, result)
+                    return
+                if parsed.path == "/api/daily/remove":
+                    result = desktop_daily_remove_items(
+                        db_path,
+                        [str(item_id) for item_id in (payload.get("item_ids") or [])],
+                    )
+                    desktop_json_response(self, result)
+                    return
+                if parsed.path == "/api/daily/update":
+                    result = desktop_daily_update_card(
+                        db_path,
+                        str(payload.get("item_id") or ""),
+                        payload.get("updates") or {},
                     )
                     desktop_json_response(self, result)
                     return
@@ -3896,7 +3949,7 @@ def launch_cdp_browser(fallback_cfg: Dict[str, Any], start_url: str = "about:bla
         return
     subprocess.Popen(cdp_browser_launch_command(fallback_cfg, start_url), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wait_for_cdp_browser(fallback_cfg, timeout=20):
-        raise RuntimeError(f"真实浏览器已尝试启动，但 {cdp_endpoint(fallback_cfg)} 没有就绪。")
+        raise RuntimeError(f"{BROWSER_NOT_READY_STATUS}：真实浏览器已尝试启动，但 {cdp_endpoint(fallback_cfg)} 没有就绪。请稍后重试或重新打开采集助手专用浏览器。")
 
 
 def youtube_video_id(url: str) -> str:
@@ -3974,7 +4027,7 @@ def connect_cdp_browser_with_recovery(playwright: Any, fallback_cfg: Dict[str, A
             return connect_cdp_browser(playwright, fallback_cfg)
         except Exception as second_error:
             raise RuntimeError(
-                f"等待登录：真实浏览器连接未就绪；请在专用浏览器完成{platform}登录后系统会自动重试。"
+                f"{BROWSER_NOT_READY_STATUS}：真实浏览器连接未就绪；不是{platform}登录问题。请稍后重试，或关闭专用浏览器后重新打开采集助手。"
             ) from second_error or first_error
 
 
@@ -4035,6 +4088,15 @@ def table_health_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if status in (LOGIN_STATUSES | RETRY_LOGIN_STATUSES):
                 platform = detect_platform(url)
                 summary["waiting_login"].append({"table_id": table_id, "record_id": record_id, "platform": platform})
+                table_info["problems"].append({
+                    "row": index,
+                    "record_id": record_id,
+                    "status": status,
+                    "platform": platform,
+                    "error": as_text(fields.get(names["error"]))[:180],
+                })
+            elif status in BROWSER_RETRY_STATUSES:
+                platform = detect_platform(url)
                 table_info["problems"].append({
                     "row": index,
                     "record_id": record_id,
@@ -4290,7 +4352,7 @@ def extract_with_real_browser(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
                     browser = connect_cdp_browser(p, fallback_cfg)
                 except Exception as e:
                     raise RuntimeError(
-                        f"等待登录：真实浏览器连接未就绪；请在专用浏览器完成{platform}登录后系统会自动重试。"
+                        f"{BROWSER_NOT_READY_STATUS}：真实浏览器连接未就绪；不是{platform}登录问题。请稍后重试，或关闭专用浏览器后重新打开采集助手。"
                     ) from e
             try:
                 context = browser.contexts[0] if browser.contexts else browser.new_context(
@@ -4352,7 +4414,7 @@ def extract_with_real_browser(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
                     text = str(e)
                     if "Target page" in text or "context or browser has been closed" in text:
                         raise RuntimeError(
-                            f"等待登录：真实浏览器页面已关闭或登录态未就绪；请在专用浏览器完成{platform}登录后系统会自动重试。"
+                            f"{BROWSER_CONNECTION_STATUS}：真实浏览器页面已关闭或连接断开；不是{platform}登录问题。请重新打开专用浏览器后再采集。"
                         ) from e
                     raise
             finally:
@@ -5723,16 +5785,6 @@ def desktop_open_url(url: str) -> Dict[str, Any]:
     return {"ok": bool(ok), "url": url}
 
 
-def desktop_open_login_browser(platform: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    platform = str(platform or "抖音").strip() or "抖音"
-    url = LOGIN_URLS.get(platform) or LOGIN_URLS["抖音"]
-    fallback_cfg = browser_fallback_config(cfg)
-    if not fallback_cfg.get("enabled", True):
-        raise ValueError("专用浏览器未启用，请检查 browser_fallback 配置。")
-    launch_cdp_browser(fallback_cfg, url)
-    return {"ok": True, "platform": platform, "url": url, "message": f"已打开{platform}登录浏览器。"}
-
-
 def desktop_save_cover_file(
     url: str,
     cfg: Dict[str, Any],
@@ -6079,11 +6131,12 @@ def status_fields(cfg: Dict[str, Any], status: str, error: str, field_types: Opt
 def classify_processing_error(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
+    if BROWSER_NOT_READY_STATUS in text or "没有就绪" in text or "连接未就绪" in text or "connect_over_cdp" in lowered:
+        return BROWSER_NOT_READY_STATUS
+    if BROWSER_CONNECTION_STATUS in text or "target page, context or browser has been closed" in lowered:
+        return BROWSER_CONNECTION_STATUS
     if (
         "等待登录" in text
-        or "真实浏览器" in text
-        or "connect_over_cdp" in lowered
-        or "target page, context or browser has been closed" in lowered
     ):
         return WAITING_LOGIN_STATUS
     if "没有找到 yt-dlp" in text or "yt-dlp not found" in lowered or "yt-dlp缺失" in text:
@@ -6210,6 +6263,8 @@ def should_process_blank_record(record: Dict[str, Any], cfg: Dict[str, Any], now
     if not title and not caption and status in LOGIN_STATUSES:
         return True
     if not title and not caption and status in RETRY_LOGIN_STATUSES:
+        return waiting_login_retry_due(fields, cfg, now)
+    if not title and not caption and status in BROWSER_RETRY_STATUSES:
         return waiting_login_retry_due(fields, cfg, now)
     return bool(title and not caption and status in RETRY_TRANSCRIPT_STATUSES)
 
@@ -6976,7 +7031,6 @@ def cmd_desktop_app(args: argparse.Namespace) -> None:
     db_path = Path(args.db) if args.db else DESKTOP_DB_PATH
     desktop_db_init(db_path)
     desktop_start_queue_worker(db_path, cfg)
-    desktop_ensure_public_tunnel_monitor(db_path)
     url = f"http://{args.host}:{args.port}/"
     try:
         server = http.server.ThreadingHTTPServer(
@@ -7004,6 +7058,20 @@ def cmd_desktop_app(args: argparse.Namespace) -> None:
         print("橙子内容采集助手已停止。", flush=True)
     finally:
         server.server_close()
+
+
+def cmd_export_max_daily(args: argparse.Namespace) -> None:
+    db_path = Path(args.db) if args.db else DESKTOP_DB_PATH
+    desktop_db_init(db_path)
+    table_id = str(args.table_id or "").strip()
+    if not table_id:
+        tables = desktop_list_tables(db_path)
+        if not tables:
+            raise SystemExit("没有可导出的采集表。")
+        table_id = str(tables[0].get("id") or "")
+    output = Path(args.output).expanduser() if args.output else None
+    result = desktop_save_export_file(db_path, table_id, "max-daily", output)
+    print(f"MAX 日报已生成：{result['path']}", flush=True)
 
 
 def cmd_make_config(_: argparse.Namespace) -> None:
@@ -7100,6 +7168,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--db", default="", help="本地数据库路径，默认 desktop_collector.sqlite3")
     s.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
     s.set_defaults(fn=cmd_desktop_app)
+
+    s = sub.add_parser("export-max-daily", help="把本地采集表导出成可直接给 Max 阅读的 Markdown 日报")
+    s.add_argument("--db", default="", help="本地数据库路径，默认 desktop_collector.sqlite3")
+    s.add_argument("--table-id", default="", help="采集表 ID，默认使用最近更新的采集表")
+    s.add_argument("--output", default="", help="输出路径；不填则弹出系统保存窗口")
+    s.set_defaults(fn=cmd_export_max_daily)
 
     return p
 
