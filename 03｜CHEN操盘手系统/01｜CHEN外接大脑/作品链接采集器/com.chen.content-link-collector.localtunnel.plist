@@ -5,9 +5,6 @@
   <key>Label</key>
   <string>com.chen.content-link-collector.localtunnel</string>
 
-  <key>WorkingDirectory</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器</string>
-
   <key>ProgramArguments</key>
   <array>
     <string>/Users/chen.zip/.local/bin/npx</string>
@@ -35,9 +32,9 @@
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器/logs/localtunnel.out.log</string>
+  <string>/Users/chen.zip/Library/Logs/CHEN Content Link Collector/localtunnel.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/chen.zip/Desktop/CHEN BRAIN/03｜CHEN操盘手系统/01｜CHEN外接大脑/作品链接采集器/logs/localtunnel.err.log</string>
+  <string>/Users/chen.zip/Library/Logs/CHEN Content Link Collector/localtunnel.err.log</string>
 </dict>
 </plist>
