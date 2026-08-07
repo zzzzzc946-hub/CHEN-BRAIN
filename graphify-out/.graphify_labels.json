@@ -486,5 +486,20 @@
   "484": "getHotkeyForCommand",
   "485": "normalizeChatViewPlacement",
   "486": "_mac",
-  "487": "QM"
+  "487": "QM",
+  "488": "LS",
+  "489": "selectResourceURL",
+  "490": "_isoDate",
+  "491": "_isoDateTime",
+  "492": "_isoTime",
+  "493": "xP",
+  "494": "_array",
+  "495": "_base64url",
+  "496": "createReadOnlyHook",
+  "497": "_cuid",
+  "498": "getActiveBrowserView",
+  "499": "_nanoid",
+  "500": "_ulid",
+  "501": "_uuid",
+  "502": "_void"
 }
