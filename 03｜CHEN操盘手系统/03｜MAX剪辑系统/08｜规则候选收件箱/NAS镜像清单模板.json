@@ -1,0 +1,14 @@
+{
+  "source_repository": "zzzzzc946-hub/CHEN-BRAIN",
+  "source_branch": "main",
+  "source_commit": "<Git已确认提交SHA>",
+  "generated_at": "<UTC时间>",
+  "direction": "git-to-nas-only",
+  "files": [
+    {
+      "path": "03｜CHEN操盘手系统/03｜MAX剪辑系统/<文件名>",
+      "sha256": "<文件哈希>"
+    }
+  ],
+  "on_drift": "REVIEW; never copy NAS back to Git"
+}
