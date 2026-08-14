@@ -61,5 +61,8 @@ worktrees/
 .env.*
 !.env.example
 
+# Per-machine role; copy the tracked example and keep the real role local.
+config/machine-role.json
+
 # MAX local scoring system secrets
 04｜MAX × CHEN AI协同系统/MAX文案评分系统/config.json
