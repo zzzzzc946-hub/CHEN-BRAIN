@@ -1,0 +1,21 @@
+# The secondary editor may only create a new unowned file in 08/open/.
+# Formal MAX rules and governance boundaries require the decision hub owner.
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/00｜MAX剪辑系统入口与读取顺序.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/01｜MAX剪辑画像.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/02｜MAX账号与受众.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/03｜MAX粗剪判断标准.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/04｜MAX自有视频案例库.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/05｜外部对标视频案例库.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/06｜MAX剪辑反馈与校准库.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜ @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/processed/ @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/governance/ @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/README.md @zzzzzc946-hub
+/03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/规则候选模板.md @zzzzzc946-hub
+/.github/ @zzzzzc946-hub
+/.githooks/ @zzzzzc946-hub
+/scripts/governance/ @zzzzzc946-hub
+/tests/governance/ @zzzzzc946-hub
+/requirements-governance.txt @zzzzzc946-hub
+/config/machine-role.example.json @zzzzzc946-hub
+/.gitignore @zzzzzc946-hub

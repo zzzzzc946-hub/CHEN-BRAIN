@@ -12,9 +12,10 @@
 
 ## 提交协议
 
-1. 视频开始前执行 `git pull --ff-only`，将 `git rev-parse HEAD` 记为规则 SHA。
-2. 视频结束后，在 `open/` 新建独立候选，不改正式规则。
-3. 提交前再次拉取；推送被拒绝时先拉取并解决文件级冲突，禁止强推。
-4. 决策中枢完成裁决后，在同一提交中更新正式规则、候选状态与关联记录。
+1. 次电脑从 `config/machine-role.example.json` 复制出被忽略的 `config/machine-role.json`，并设置唯一 `machine_id` 与 `editor` 角色。
+2. 视频开始前同步 `origin/main`，把正式规则 SHA 写入任务卡；候选只作为最多三条冻结参考之一。
+3. 视频结束后先在本地完成候选草稿，再执行 `python3 -m scripts.governance.cli submit-candidate --draft <候选文件> --dry-run`。该命令只在临时工作树中验证“唯一新增的 open 候选”，不会改动主工作区、不会推送。
+4. 正式候选 PR 与自动合并将在服务端治理边界启用后开放；在此之前不得直接推送 `main`、不得手工移动或改写 `open/` 候选。
+5. 决策中枢只在正式治理 PR 中处理候选、规则与发布，不接受次电脑直接改写正式规则。
 
 NAS 只镜像 Git 已确认的提交，不是候选或正式规则的反向写入源。
