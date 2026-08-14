@@ -35,6 +35,21 @@ class DiffGateTest(unittest.TestCase):
 
             self.assertIn("missing required field: machine_id", errors)
 
+    def test_classifies_a_formal_governance_only_change_separately(self) -> None:
+        result = classify_changes([
+            GitChange(
+                "M",
+                "03｜CHEN操盘手系统/03｜MAX剪辑系统/06｜剪辑迭代库/剪辑规则.md",
+            ),
+            GitChange(
+                "A",
+                "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/governance/review-batches/RB-20260814-abc123.yaml",
+            ),
+        ])
+
+        self.assertEqual(result.kind, "formal_governance")
+        self.assertEqual(result.errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

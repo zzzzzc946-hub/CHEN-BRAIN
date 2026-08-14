@@ -6,6 +6,17 @@ from scripts.governance.candidate import Candidate, validate_candidate
 
 
 OPEN_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/open/"
+MAX_RULES_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/"
+FORMAL_PREFIXES = (
+    MAX_RULES_PREFIX,
+    ".github/",
+    ".githooks/",
+    "scripts/governance/",
+    "tests/governance/",
+    "config/machine-role.example.json",
+    "requirements-governance.txt",
+    ".gitignore",
+)
 
 
 @dataclass(frozen=True)
@@ -23,6 +34,12 @@ class ChangeClassification:
 def classify_changes(changes: Sequence[GitChange]) -> ChangeClassification:
     if len(changes) == 1 and changes[0].status == "A" and changes[0].path.startswith(OPEN_PREFIX) and changes[0].path.endswith(".md"):
         return ChangeClassification("candidate", [])
+    if changes and all(
+        not change.path.startswith(OPEN_PREFIX)
+        and any(change.path.startswith(prefix) for prefix in FORMAL_PREFIXES)
+        for change in changes
+    ):
+        return ChangeClassification("formal_governance", [])
     return ChangeClassification("invalid", ["candidate PR may only add one open candidate"])
 
 
