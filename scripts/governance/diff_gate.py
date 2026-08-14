@@ -16,6 +16,7 @@ FORMAL_PREFIXES = (
     MAX_RULES_PREFIX,
     ".github/",
     ".githooks/",
+    "scripts/__init__.py",
     "scripts/governance/",
     "tests/governance/",
     "config/machine-role.example.json",

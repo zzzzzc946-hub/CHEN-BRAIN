@@ -64,6 +64,11 @@ class DiffGateTest(unittest.TestCase):
 
         self.assertIn("formal rule change requires review batch, release, and current-release update", errors)
 
+    def test_accepts_the_governance_package_initializer(self) -> None:
+        result = classify_changes([GitChange("A", "scripts/__init__.py")])
+
+        self.assertEqual(result.kind, "formal_governance")
+
     def test_pr_validation_rejects_candidate_with_invalid_contents(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
