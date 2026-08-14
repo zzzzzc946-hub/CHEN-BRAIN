@@ -8,6 +8,10 @@ from scripts.governance.candidate import Candidate, validate_candidate
 
 OPEN_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/open/"
 MAX_RULES_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/"
+PROCESSED_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/processed/"
+REVIEW_BATCH_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/governance/review-batches/"
+RELEASE_PREFIX = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/governance/releases/"
+CURRENT_RELEASE_PATH = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/governance/current-release.yaml"
 FORMAL_PREFIXES = (
     MAX_RULES_PREFIX,
     ".github/",
@@ -97,5 +101,17 @@ def validate_pr_changes(repo: Path, changes: Sequence[GitChange]) -> list[str]:
     if classification.kind == "invalid":
         return classification.errors
     if classification.kind == "formal_governance":
+        requires_release = any(
+            change.path.startswith(PROCESSED_PREFIX)
+            or change.path.startswith(MAX_RULES_PREFIX + f"0{number}")
+            for change in changes
+            for number in range(8)
+        )
+        if requires_release:
+            has_batch = any(change.status == "A" and change.path.startswith(REVIEW_BATCH_PREFIX) for change in changes)
+            has_release = any(change.status == "A" and change.path.startswith(RELEASE_PREFIX) for change in changes)
+            has_pointer = any(change.path == CURRENT_RELEASE_PATH and change.status in {"A", "M"} for change in changes)
+            if not (has_batch and has_release and has_pointer):
+                return ["formal rule change requires review batch, release, and current-release update"]
         return []
     return validate_candidate_change(repo, changes[0])

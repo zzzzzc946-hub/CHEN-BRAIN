@@ -7,7 +7,7 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-FORMAL_RULE = "03｜CHEN操盘手系统/03｜MAX剪辑系统/06｜剪辑迭代库/剪辑规则.md"
+FORMAL_GOVERNANCE = "scripts/governance/contract.md"
 
 
 class GovernanceCliTest(unittest.TestCase):
@@ -21,10 +21,10 @@ class GovernanceCliTest(unittest.TestCase):
             subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
             base = self.git_sha(repo)
-            formal_path = repo / FORMAL_RULE
+            formal_path = repo / FORMAL_GOVERNANCE
             formal_path.parent.mkdir(parents=True)
             formal_path.write_text("formal rule\n", encoding="utf-8")
-            subprocess.run(["git", "add", FORMAL_RULE], cwd=repo, check=True)
+            subprocess.run(["git", "add", FORMAL_GOVERNANCE], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "formal"], cwd=repo, check=True, capture_output=True)
             head = self.git_sha(repo)
             environment = os.environ.copy()
@@ -45,10 +45,10 @@ class GovernanceCliTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             repo = Path(directory)
             self.initialize_repository(repo)
-            formal_path = repo / FORMAL_RULE
+            formal_path = repo / FORMAL_GOVERNANCE
             formal_path.parent.mkdir(parents=True)
             formal_path.write_text("formal rule\n", encoding="utf-8")
-            subprocess.run(["git", "add", FORMAL_RULE], cwd=repo, check=True)
+            subprocess.run(["git", "add", FORMAL_GOVERNANCE], cwd=repo, check=True)
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(PROJECT_ROOT)
 

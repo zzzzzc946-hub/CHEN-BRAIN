@@ -57,6 +57,13 @@ class DiffGateTest(unittest.TestCase):
         self.assertEqual(result.kind, "formal_governance")
         self.assertEqual(result.errors, [])
 
+    def test_rejects_a_formal_rule_change_without_release_artifacts(self) -> None:
+        errors = validate_pr_changes(Path("."), [
+            GitChange("M", "03｜CHEN操盘手系统/03｜MAX剪辑系统/03｜MAX粗剪判断标准.md"),
+        ])
+
+        self.assertIn("formal rule change requires review batch, release, and current-release update", errors)
+
     def test_pr_validation_rejects_candidate_with_invalid_contents(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
