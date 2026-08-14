@@ -1,0 +1,8 @@
+schema_version: 1
+release_id: MAX-RULES-20260814-001
+status: active
+rules_schema: 1
+skill_impact: none
+minimum_my_video_commit: 9530a69ea04058eaff9fe5f75c0e0debdb2e59cc
+previous_release_id: BOOTSTRAP
+review_batch_id: RB-20260814-bootstrap
