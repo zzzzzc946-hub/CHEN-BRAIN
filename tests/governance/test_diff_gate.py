@@ -1,8 +1,15 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import subprocess
 
-from scripts.governance.diff_gate import GitChange, classify_changes, validate_candidate_change
+from scripts.governance.diff_gate import (
+    GitChange,
+    changes_between,
+    classify_changes,
+    validate_candidate_change,
+    validate_pr_changes,
+)
 
 
 OPEN = "03｜CHEN操盘手系统/03｜MAX剪辑系统/08｜规则候选收件箱/open/CR-20260814-120000-max-secondary-video-abc123.md"
@@ -49,6 +56,42 @@ class DiffGateTest(unittest.TestCase):
 
         self.assertEqual(result.kind, "formal_governance")
         self.assertEqual(result.errors, [])
+
+    def test_pr_validation_rejects_candidate_with_invalid_contents(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / OPEN
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("---\ncandidate_id: CR-20260814-120000-max-secondary-video-abc123\n---\n", encoding="utf-8")
+
+            errors = validate_pr_changes(root, [GitChange("A", OPEN)])
+
+            self.assertIn("missing required field: machine_id", errors)
+
+    def test_reads_added_path_from_a_git_commit_range(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            candidate = root / OPEN
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", str(candidate.relative_to(root))], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate"], cwd=root, check=True, capture_output=True)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            changes = changes_between(root, base, head)
+
+            self.assertEqual(changes, [GitChange("A", OPEN)])
 
 
 if __name__ == "__main__":
