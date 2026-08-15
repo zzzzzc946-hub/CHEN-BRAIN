@@ -4,11 +4,12 @@ from pathlib import Path
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
+from urllib.parse import urlparse
 
 from scripts.governance.candidate import Candidate, validate_candidate
 
 OPEN_INBOX = Path("03｜CHEN操盘手系统") / "03｜MAX剪辑系统" / "08｜规则候选收件箱" / "open"
-EXPECTED_ORIGIN = "github.com:zzzzzc946-hub/CHEN-BRAIN.git"
+EXPECTED_REPOSITORY = "github.com/zzzzzc946-hub/chen-brain"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,17 @@ def _run_git(repo: Path, args: list[str], capture_output: bool = False) -> subpr
     return subprocess.run(
         ["git", *args], cwd=repo, check=True, capture_output=capture_output, text=True
     )
+
+
+def canonical_remote(remote: str) -> str:
+    value = remote.strip().rstrip("/")
+    if value.startswith("git@") and ":" in value:
+        host, repository = value[4:].split(":", 1)
+    else:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        repository = parsed.path.lstrip("/")
+    return f"{host.lower()}/{repository.removesuffix('.git').strip('/').lower()}"
 
 
 def load_machine_role(repo: Path) -> MachineRole:
@@ -54,10 +66,10 @@ def preflight(repo: Path, role: MachineRole) -> str:
     if role.role != "editor":
         raise ValueError("only editor machines may submit rule candidates")
     try:
-        origin = _run_git(repo, ["remote", "get-url", "origin"], capture_output=True).stdout.strip()
+        origin = _run_git(repo, ["config", "--get", "remote.origin.url"], capture_output=True).stdout.strip()
     except subprocess.CalledProcessError as error:
         raise ValueError("candidate submission requires an origin remote") from error
-    if EXPECTED_ORIGIN not in origin:
+    if canonical_remote(origin) != EXPECTED_REPOSITORY:
         raise ValueError("origin must point to zzzzzc946-hub/CHEN-BRAIN")
     try:
         return _run_git(repo, ["rev-parse", "--verify", "origin/main"], capture_output=True).stdout.strip()
@@ -82,7 +94,12 @@ def submit_candidate(repo: Path, draft: Path, dry_run: bool = True, push: bool =
         try:
             changed_paths = prepare_candidate_commit(worktree, draft, candidate.candidate_id)
             if push:
-                raise ValueError("candidate push is unavailable until the server-side governance gate is installed")
+                _run_git(worktree, ["commit", "-m", f"candidate: {candidate.candidate_id}"])
+                _run_git(
+                    worktree,
+                    ["push", "origin", f"HEAD:refs/heads/{branch}"],
+                    capture_output=True,
+                )
             return SubmissionResult(
                 candidate_id=candidate.candidate_id,
                 branch=branch,

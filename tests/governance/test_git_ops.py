@@ -63,6 +63,21 @@ class CandidateCommitPreparationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "only editor"):
                 preflight(root, MachineRole(machine_id="max-primary", role="decision-hub"))
 
+    def test_preflight_accepts_https_github_remote(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repository(root)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/zzzzzc946-hub/CHEN-BRAIN.git"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "branch", "origin/main"], cwd=root, check=True)
+
+            base_sha = preflight(root, MachineRole(machine_id="max-secondary", role="editor"))
+
+            self.assertEqual(len(base_sha), 40)
+
     def test_dry_run_uses_temporary_worktree_without_staging_source_repo(self) -> None:
         candidate_id = "CR-20260814-120000-max-secondary-video-abc123"
         with TemporaryDirectory() as directory:
@@ -128,6 +143,47 @@ class CandidateCommitPreparationTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "requires explicit push permission"):
                 submit_candidate(source, draft, dry_run=False)
+
+    def test_push_submission_commits_and_pushes_candidate_branch(self) -> None:
+        candidate_id = "CR-20260814-120000-max-secondary-video-abc123"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self.make_repository(source)
+            bare = root / "origin.git"
+            subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=source, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=source, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", "https://github.com/zzzzzc946-hub/CHEN-BRAIN.git"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "url.file://" + str(bare) + ".insteadOf", "https://github.com/zzzzzc946-hub/CHEN-BRAIN.git"],
+                cwd=source,
+                check=True,
+            )
+            config = source / "config"
+            config.mkdir()
+            (config / "machine-role.json").write_text(
+                '{"machine_id": "max-secondary", "role": "editor"}\n', encoding="utf-8"
+            )
+            draft = root / f"{candidate_id}.md"
+            draft.write_text(self.valid_candidate(candidate_id), encoding="utf-8")
+
+            result = submit_candidate(source, draft, dry_run=False, push=True)
+
+            self.assertEqual(result.branch, f"candidate/max-secondary/{candidate_id}")
+            pushed = subprocess.run(
+                ["git", "show-ref", "--verify", f"refs/heads/{result.branch}"],
+                cwd=bare,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn(result.branch, pushed)
 
     @staticmethod
     def valid_candidate(candidate_id: str) -> str:
