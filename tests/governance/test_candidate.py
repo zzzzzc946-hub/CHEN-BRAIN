@@ -1,8 +1,10 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from scripts.governance.candidate import Candidate, validate_candidate
+import scripts.governance.candidate as candidate_module
 
 
 VALID_CANDIDATE = """---
@@ -36,6 +38,15 @@ status: OPEN_VERIFIED_ONCE
 
 
 class CandidateValidationTest(unittest.TestCase):
+    def test_missing_pyyaml_reports_install_command(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.md"
+            path.write_text("---\nkey: value\n---\n", encoding="utf-8")
+
+            with patch.object(candidate_module, "yaml", None):
+                with self.assertRaisesRegex(RuntimeError, "python3 -m pip install -r requirements-governance.txt"):
+                    Candidate.from_path(path)
+
     def test_accepts_a_complete_candidate_with_a_matching_filename(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "CR-20260814-120000-max-secondary-video-abc123.md"

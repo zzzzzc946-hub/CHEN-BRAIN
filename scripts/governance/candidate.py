@@ -3,7 +3,10 @@ from pathlib import Path
 import re
 from typing import Any, Optional
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - exercised through the CLI environment
+    yaml = None
 
 
 REQUIRED_FIELDS = {
@@ -59,6 +62,11 @@ class Candidate:
 
     @classmethod
     def from_path(cls, path: Path) -> "Candidate":
+        if yaml is None:
+            raise RuntimeError(
+                "PyYAML is required for governance CLI; run "
+                "python3 -m pip install -r requirements-governance.txt"
+            )
         text = path.read_text(encoding="utf-8")
         if not text.startswith("---\n"):
             raise ValueError("candidate frontmatter must start with ---")
