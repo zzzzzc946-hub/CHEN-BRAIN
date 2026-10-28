@@ -1,0 +1,8 @@
+schema_version: 1
+release_id: MAX-RULES-20261028-001
+status: active
+rules_schema: 1
+skill_impact: required
+minimum_my_video_commit: 3645cfedb17310d164a9de783ec5d2f231d30cfd
+previous_release_id: MAX-RULES-20260814-001
+review_batch_id: RB-20261028-crosswindow

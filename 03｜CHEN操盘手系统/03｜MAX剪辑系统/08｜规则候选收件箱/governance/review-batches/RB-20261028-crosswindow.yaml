@@ -1,0 +1,56 @@
+schema_version: 1
+batch_id: RB-20261028-crosswindow
+base_sha: 0c12513270fd5dd72534288fcc950a99ceb72847
+candidates: []
+review_type: decision_hub_cross_window_review
+authorization: user_approved_review_publication_20261028
+review_summary: 12 visible editing tasks and 0116 local retrospective; deduplicated feedback and preserved NOT VERIFIED states
+reviewed_files:
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/00｜MAX剪辑系统入口与读取顺序.md"
+    sha256: a6904dbc64bf660f9629535d7ea858d146cd6455795b8f384461e98d6549020b
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/03｜MAX粗剪判断标准.md"
+    sha256: 3be426caa96be8fb43850bfe8cf2b52eb74f8fc2b7b4d303f6c5aee04ba8318e
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/06｜MAX剪辑反馈与校准库.md"
+    sha256: 77466227b68166dae684ea90dc019c5188d4e8c6aa33304fe16f463e35603174
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘索引.md"
+    sha256: 85223d3a63c377784ad3364a7503177eed51f98bc2265fc6e433ff727faf6b8c
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/README.md"
+    sha256: 0332b96da76d0290169a3dfafe1a308f40af48db0d6d1c0892dbef0a462f2aa2
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20260731-懂情感不一定懂展示面.md"
+    sha256: 6b2433539a6299bb15bb562d01357547c8790a5044ad23e2f3c9f771c7912ecf
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20260806-形象是男生最有价值的投资.md"
+    sha256: b9846d3bb604970ef95c644237c465e1ed917e4d4bc1032408202886b73d472a
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20260806-照片是最重要的线上资产.md"
+    sha256: 9957959d9e980dc83321d3d9393fc0b9d4fd7fcbfdd40ffee4707bc15bfcfddf
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20260808-DJI-20260803222804-0053-D.md"
+    sha256: 24064042016423986d53e3e2b607f475d199ca185b63ba266ef313f23e63e4c2
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261017-DJI-20261005014039-0059-D.md"
+    sha256: 9feabb4e5ab5993ff09ba7c15df41f247d6a45d12b176aad0feb28adf7b4b28e
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261021-DJI-20261020163217-0114-D.md"
+    sha256: 66f4a6606a280572b2615ceee63387c7a9dd989c8d18007612850f69775fb6ae
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261021-DJI-20261020164045-0116-D.md"
+    sha256: d5fd95d5af9ec1ac4ade668b6c505afd29f0e20013f88e7c1584333e0b3880ce
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261021-DJI-20261020164749-0118-D.md"
+    sha256: cd34274384235ca4d5ac6dde11b764d7eb65fc444053d38eadec88814130ace1
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261021-男生一定要认真拍照.md"
+    sha256: cd3ca5ee5fdfcdbaa47a1f9584882ca8331e44695ae982c62dd988fed021eb16
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261022-DJI-20261020165354-0119-D.md"
+    sha256: 2d589065af97bd06735eca28c2b0c19f3f2e0891a4893e88517a0a9c34423bf1
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261022-DJI-20261020210600-0121-D.md"
+    sha256: 254dab0ed7193c6f3224bab16c0836a514afe4024a386fff528c51e200a77b1b
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261022-DJI-20261020211925-0125-D.md"
+    sha256: 87314c74cec1053f5f36b780acc6838bdf28685823cb6947828f2b8237633c3a
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261022-DJI-20261020212839-0129-D.md"
+    sha256: 48180dc5d3027dee336c18c0d1e03298a08b962a831534a1ff1d8f4e61dc0b29
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261024-DJI-20261020213543-0133-D.md"
+    sha256: fc7563680a912b3e8c61617cdc5b08872734ff3f943af5d9bcabae094374bdd7
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261024-DJI-20261020213905-0134-D.md"
+    sha256: d60bd849681bfc8609e6b42ebba3ede4a2121bedc6169300b020337ffbeb3383
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261024-DJI-20261020215254-0139-D.md"
+    sha256: f94ba253167e203d590f3ceb84d02306cb16f1c189ddecda93a8eb2df327217a
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/VR-20261024-这个时代没有人能离开展示面理论.md"
+    sha256: 26149ada9c924ef417ce0d7398386f9886d0bc7aa0fc1f1b2a64db644d9fe6ba
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/视频复盘模板.md"
+    sha256: 3174d0949ea4b17678a8131ab64af3d1916c8ac2a793c0f2cad8fec0a5f678c3
+  - path: "03｜CHEN操盘手系统/03｜MAX剪辑系统/07｜视频复盘归档/跨窗口回流审阅-20261028.md"
+    sha256: 133cfaed519a7f4df8801cd1419473764b2374d0abd8930061738bdf415c0ab3
